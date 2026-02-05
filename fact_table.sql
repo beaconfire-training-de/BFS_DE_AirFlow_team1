@@ -78,8 +78,8 @@ USING (
         sh.OPEN                        AS OPEN_PRICE,
         sh.HIGH                        AS HIGH_PRICE,
         sh.LOW                         AS LOW_PRICE,
+		sh.ADJCLOSE                    AS ADJCLOSE_PRICE,
         sh.CLOSE                       AS CLOSE_PRICE,
-        sh.ADJCLOSE                    AS ADJCLOSE_PRICE,
         sh.VOLUME                      AS VOLUME,
 
         /* ===== Derived metrics ===== */

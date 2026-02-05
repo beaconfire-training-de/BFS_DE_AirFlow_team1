@@ -195,55 +195,78 @@ INNER JOIN AIRFLOW0105.DEV.dim_Date_1 d ON TO_NUMBER(TO_CHAR(swc.DATE, 'YYYYMMDD
 LEFT JOIN AIRFLOW0105.DEV.dim_Company_1 c ON swc.SYMBOL = c.symbol;"""
     )
 
+    SQL_VALIDATE_ROW_COUNTS = """
+                              -- Validation: Check row counts
+                              SELECT 'dim_company_QA_v3 (total)' AS table_name, COUNT(*) AS row_count \
+                              FROM AIRFLOW0105.DEV.dim_company_QA_v3
+                              UNION ALL
+                              SELECT 'dim_company_QA_v3 (current)' AS table_name, COUNT(*) AS row_count \
+                              FROM AIRFLOW0105.DEV.dim_company_QA_v3 \
+                              WHERE is_current = TRUE
+                              UNION ALL
+                              SELECT 'dim_company_QA_v3 (historical)' AS table_name, COUNT(*) AS row_count \
+                              FROM AIRFLOW0105.DEV.dim_company_QA_v3 \
+                              WHERE is_current = FALSE
+                              UNION ALL
+                              SELECT 'dim_date_QA_v3' AS table_name, COUNT(*) AS row_count \
+                              FROM AIRFLOW0105.DEV.dim_date_QA_v3
+                              UNION ALL
+                              SELECT 'fact_stock_daily_QA_v3' AS table_name, COUNT(*) AS row_count \
+                              FROM AIRFLOW0105.DEV.fact_stock_daily_QA_v3
+                              UNION ALL
+                              SELECT 'source_symbols' AS table_name, COUNT(*) AS row_count \
+                              FROM US_STOCK_DAILY.DCCM.Symbols
+                              UNION ALL
+                              SELECT 'source_stock_history' AS table_name, COUNT(*) AS row_count \
+                              FROM US_STOCK_DAILY.DCCM.Stock_History; \
+                              """
+
+    SQL_VALIDATE_REFERENTIAL_INTEGRITY = """
+                                         -- Validation: Check for orphan records in fact table
+                                         SELECT 'orphan_company_keys' AS check_name, \
+                                                COUNT(*)              AS orphan_count
+                                         FROM AIRFLOW0105.DEV.fact_stock_daily_QA_v3 f
+                                                  LEFT JOIN AIRFLOW0105.DEV.dim_company_QA_v3 c ON f.company_key = c.company_key
+                                         WHERE c.company_key IS NULL
+
+                                         UNION ALL
+
+                                         SELECT 'orphan_date_keys' AS check_name, \
+                                                COUNT(*)           AS orphan_count
+                                         FROM AIRFLOW0105.DEV.fact_stock_daily_QA_v3 f
+                                                  LEFT JOIN AIRFLOW0105.DEV.dim_date_QA_v3 d ON f.date_key = d.date_key
+                                         WHERE d.date_key IS NULL; \
+                                         """
+
+    SQL_VALIDATE_SCD2 = """
+    -- Validation: Check SCD Type 2 integrity
+    -- Each symbol should have exactly one current record
+    SELECT 
+        'symbols_with_multiple_current' AS check_name,
+        COUNT(*) AS issue_count
+    FROM (
+        SELECT symbol, COUNT(*) as cnt
+        FROM AIRFLOW0105.DEV.dim_company_QA_v3
+        WHERE is_current = TRUE
+        GROUP BY symbol
+        HAVING COUNT(*) > 1
+    )
+    UNION ALL
+    SELECT 
+        'symbols_with_no_current' AS check_name,
+        COUNT(*) AS issue_count
+    FROM (
+        SELECT DISTINCT symbol 
+        FROM AIRFLOW0105.DEV.dim_company_QA_v3
+        WHERE symbol NOT IN (
+            SELECT symbol FROM AIRFLOW0105.DEV.dim_company_QA_v3 WHERE is_current = TRUE
+        )
+    );
+    """
+
     validate = SnowflakeOperator(
         task_id="validate",
         snowflake_conn_id="jan_airflow_snowflake",
-        sql="""SELECT * FROM US_STOCK_DAILY.DCCM.COMPANY_PROFILE LIMIT 10;
-
-SELECT * FROM US_STOCK_DAILY.DCCM.STOCK_HISTORY LIMIT 10;
-
-SELECT * FROM US_STOCK_DAILY.DCCM.SYMBOLS LIMIT 10;
-
--- test symbol name exchange from SYMBOLS table and symbol, companyname, and exchange from COMPANY_profile 
--- test the symbol column frequncy and same 
-
-SELECT COUNT(distinct symbol) FROM US_STOCK_DAILY.DCCM.SYMBOLS; -- 10913 different symbol in SYMBOLS
-SELECT COUNT(distinct symbol) FROM US_STOCK_DAILY.DCCM.COMPANY_PROFILE; -- 10913 different symbol in COMPANY_PROFILE
-
-WITH cte1 AS(SELECT distinct symbol FROM US_STOCK_DAILY.DCCM.SYMBOLS),
-cte2 AS(SELECT distinct symbol from US_STOCK_DAILY.DCCM.COMPANY_PROFILE)
-SELECT
-count(*)
-FROM cte1
-JOIN cte2
-USING (symbol);
--- 10913 same symbol between two table, which means they are same
-
--- STEP2: test the NAME & Companyname column frequncy and same 
-SELECT COUNT(distinct name) FROM US_STOCK_DAILY.DCCM.SYMBOLS; -- 10607 different symbol in SYMBOLS
-SELECT COUNT(distinct companyname) FROM US_STOCK_DAILY.DCCM.COMPANY_PROFILE; -- 10606 different symbol in COMPANY_PROFILE
-
-WITH cte1 AS(SELECT distinct name FROM US_STOCK_DAILY.DCCM.SYMBOLS),
-cte2 AS(SELECT distinct companyname from US_STOCK_DAILY.DCCM.COMPANY_PROFILE)
-SELECT
-count(*)
-FROM cte1
-JOIN cte2
-ON cte1.name = cte2.companyname;
--- 10606 same symbol between two table, which means they are same
-
--- STEP3: test the Exchange column frequncy and same 
-SELECT COUNT(distinct exchange) FROM US_STOCK_DAILY.DCCM.SYMBOLS; -- 24 different symbol in SYMBOLS
-SELECT COUNT(distinct exchange) FROM US_STOCK_DAILY.DCCM.COMPANY_PROFILE; -- 23 different symbol in COMPANY_PROFILE
-
-WITH cte1 AS(SELECT distinct exchange FROM US_STOCK_DAILY.DCCM.SYMBOLS),
-cte2 AS(SELECT distinct exchange from US_STOCK_DAILY.DCCM.COMPANY_PROFILE)
-SELECT
-count(*)
-FROM cte1
-JOIN cte2
-ON cte1.exchange = cte2.exchange;
--- 23 same symbol between two table, which means they are same""",
+        sql=SQL_VALIDATE_ROW_COUNTS
     )
-
     load_fact >> validate

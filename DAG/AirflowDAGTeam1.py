@@ -262,4 +262,4 @@ ON cte1.exchange = cte2.exchange;
 -- 23 same symbol between two table, which means they are same""",
     )
 
-     load_fact >> validate
+    load_fact >> validate

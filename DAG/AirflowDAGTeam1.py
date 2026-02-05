@@ -12,7 +12,7 @@ SNOWFLAKE_CONN_ID = "jan_airflow_snowflake"
 default_args = {
     "owner": GROUP_NUM,
     "depends_on_past": False,
-    "retries": 1,
+    "retries": 0,
     "retry_delay": timedelta(minutes=3),
 }
 

@@ -6,10 +6,11 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
 
+GROUP_NUM = "team1"
 SNOWFLAKE_CONN_ID = "jan_airflow_snowflake"
 
 default_args = {
-    "owner": "team1",
+    "owner": GROUP_NUM,
     "depends_on_past": False,
     "retries": 1,
     "retry_delay": timedelta(minutes=3),

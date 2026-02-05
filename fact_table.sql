@@ -74,7 +74,7 @@ JOIN DIM_COMPANY dc
 
 --merge fact table
 
-MERGE INTO AIRFLOW0105.DEV.FACT_STOCK_DAILY_1 tgt
+MERGE INTO AIRFLOW0105.DEV.FACT_STOCK_HISTORY_1 tgt
 USING (
     SELECT
         dd.DATE_KEY,
@@ -100,17 +100,17 @@ USING (
     JOIN DIM_COMPANY dc
       ON sh.SYMBOL = dc.SYMBOL
 ) src
-ON  tgt.DATE_KEY    = src.DATE_KEY
-AND tgt.SYMBOL_KEY  = src.SYMBOL_KEY
+ON  tgt.DATE_KEY    = src.DATE
+AND tgt.SYMBOL_KEY  = src.SYMBOL
 AND tgt.COMPANY_KEY = src.COMPANY_KEY
 
 WHEN MATCHED THEN UPDATE SET
-    tgt.OPEN_PRICE   = src.OPEN_PRICE,
-    tgt.HIGH_PRICE   = src.HIGH_PRICE,
-    tgt.LOW_PRICE    = src.LOW_PRICE,
-    tgt.CLOSE_PRICE  = src.CLOSE_PRICE,
+    tgt.OPEN_PRICE   = src.OPEN,
+    tgt.HIGH_PRICE   = src.HIGH,
+    tgt.LOW_PRICE    = src.LOW,
+    tgt.CLOSE_PRICE  = src.CLOSE,
     tgt.VOLUME       = src.VOLUME,
-	tgt.ADJ_CLOSE    = src.ADJCLOSE_PRICE,
+	tgt.ADJCLOSE_PRICE    = src.ADJ_CLOSE,
     tgt.VOLAVG       = src.VOLAVG,
     tgt.CHANGES      = src.CHANGES,
     tgt.MA_7         = src.MA_7,
@@ -137,15 +137,15 @@ WHEN NOT MATCHED THEN INSERT (
     DAILY_CHANGE
 )
 VALUES (
-    src.DATE_KEY,
-    src.SYMBOL_KEY,
+    src.DATE,
+    src.SYMBOL,
     src.COMPANY_KEY,
-    src.OPEN_PRICE,
-    src.HIGH_PRICE,
-    src.LOW_PRICE,
-    src.CLOSE_PRICE,
-    src.VOLUME_PRICE,
-	src.ADJCLOSE_PRICE,
+    src.OPEN,
+    src.HIGH,
+    src.LOW,
+    src.CLOSE,
+    src.VOLUME,
+	src.ADJ_CLOSE,
     src.VOLAVG,
     src.CHANGES,
     src.MA_7,

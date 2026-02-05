@@ -71,21 +71,56 @@ JOIN DIM_COMPANY dc
 --merge fact table for new data coming in
 MERGE INTO AIRFLOW0105.DEV.FACT_STOCK_HISTORY_1 tgt
 USING (
-    SELECT
-        dd.DATE_KEY,
-        dc.COMPANY_KEY,
-        sh.OPEN,
-        sh.HIGH,
-        sh.LOW,
-        sh.CLOSE,
-        sh.VOLUME,
-        sh.ADJCLOSE,
-        sh.VOLAVG,
-        sh.CHANGES,
-        sh.MA_7,
-        sh.MA_30,
-        sh.DAILY_RETURN,
-        sh.DAILY_CHANGE
+   SELECT
+        dd.DATE_KEY                    AS DATE_KEY,
+        dc.COMPANY_KEY                 AS COMPANY_KEY,
+
+        sh.OPEN                        AS OPEN_PRICE,
+        sh.HIGH                        AS HIGH_PRICE,
+        sh.LOW                         AS LOW_PRICE,
+        sh.CLOSE                       AS CLOSE_PRICE,
+        sh.ADJCLOSE                    AS ADJCLOSE_PRICE,
+        sh.VOLUME                      AS VOLUME,
+
+        /* ===== Derived metrics ===== */
+
+        -- Daily absolute change
+        sh.CLOSE - sh.OPEN             AS DAILY_CHANGE,
+
+        -- Daily return (%)
+        CASE 
+            WHEN sh.OPEN <> 0 
+            THEN (sh.CLOSE - sh.OPEN) / sh.OPEN 
+            ELSE NULL 
+        END                            AS DAILY_RETURN,
+
+        -- Change vs previous close
+        sh.CLOSE 
+        - LAG(sh.CLOSE) OVER (
+            PARTITION BY dc.COMPANY_KEY
+            ORDER BY dd.FULL_DATE
+          )                             AS CHANGES,
+
+        -- 7-day moving average (close)
+        AVG(sh.CLOSE) OVER (
+            PARTITION BY dc.COMPANY_KEY
+            ORDER BY dd.FULL_DATE
+            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+        )                               AS MA_7,
+
+        -- 30-day moving average (close)
+        AVG(sh.CLOSE) OVER (
+            PARTITION BY dc.COMPANY_KEY
+            ORDER BY dd.FULL_DATE
+            ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+        )                               AS MA_30,
+
+        -- 7-day rolling average volume
+        AVG(sh.VOLUME) OVER (
+            PARTITION BY dc.COMPANY_KEY
+            ORDER BY dd.FULL_DATE
+            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+        )                               AS VOLAVG
     FROM STG_STOCK_HISTORY sh
     JOIN DIM_DATE dd
       ON sh.DATE = dd.FULL_DATE

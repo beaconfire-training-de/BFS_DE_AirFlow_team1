@@ -67,60 +67,93 @@ JOIN DIM_DATE dd
 JOIN DIM_COMPANY dc
   ON sh.SYMBOL = dc.SYMBOL;
 
+--update with new columns data
+UPDATE AIRFLOW0105.DEV.FACT_STOCK_HISTORY_1 tgt
+SET
+    -- Daily absolute change
+    DAILY_CHANGE = tgt.CLOSE_PRICE - tgt.OPEN_PRICE,
 
+    -- Daily return
+    DAILY_RETURN = CASE
+        WHEN tgt.OPEN_PRICE <> 0
+        THEN (tgt.CLOSE_PRICE - tgt.OPEN_PRICE) / tgt.OPEN_PRICE
+        ELSE NULL
+    END,
+
+    -- Change vs previous close
+    CHANGES = tgt.CLOSE_PRICE
+        - LAG(tgt.CLOSE_PRICE) OVER (
+            PARTITION BY tgt.COMPANY_KEY
+            ORDER BY tgt.DATE_KEY
+        ),
+
+    -- 7-day moving average (close)
+    MA_7 = AVG(tgt.CLOSE_PRICE) OVER (
+        PARTITION BY tgt.COMPANY_KEY
+        ORDER BY tgt.DATE_KEY
+        ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+    ),
+
+    -- 30-day moving average (close)
+    MA_30 = AVG(tgt.CLOSE_PRICE) OVER (
+        PARTITION BY tgt.COMPANY_KEY
+        ORDER BY tgt.DATE_KEY
+        ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+    ),
+
+    -- 7-day average volume
+    VOLAVG = AVG(tgt.VOLUME) OVER (
+        PARTITION BY tgt.COMPANY_KEY
+        ORDER BY tgt.DATE_KEY
+        ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+    ),
+
+    LOAD_TS = CURRENT_TIMESTAMP;
+    
 --merge fact table for new data coming in
 MERGE INTO AIRFLOW0105.DEV.FACT_STOCK_HISTORY_1 tgt
 USING (
-   SELECT
-        dd.DATE_KEY                    AS DATE_KEY,
-        dc.COMPANY_KEY                 AS COMPANY_KEY,
+    SELECT
+        dd.DATE_KEY,
+        dc.COMPANY_KEY,
+        sh.OPEN,
+        sh.HIGH,
+        sh.LOW,
+        sh.CLOSE,
+        sh.VOLUME,
+               -- Derived metrics
+        sh.CLOSE - sh.OPEN AS DAILY_CHANGE,
 
-        sh.OPEN                        AS OPEN_PRICE,
-        sh.HIGH                        AS HIGH_PRICE,
-        sh.LOW                         AS LOW_PRICE,
-		sh.ADJCLOSE                    AS ADJCLOSE_PRICE,
-        sh.CLOSE                       AS CLOSE_PRICE,
-        sh.VOLUME                      AS VOLUME,
+        CASE
+            WHEN sh.OPEN <> 0
+            THEN (sh.CLOSE - sh.OPEN) / sh.OPEN
+            ELSE NULL
+        END AS DAILY_RETURN,
 
-        /* ===== Derived metrics ===== */
-
-        -- Daily absolute change
-        sh.CLOSE - sh.OPEN             AS DAILY_CHANGE,
-
-        -- Daily return (%)
-        CASE 
-            WHEN sh.OPEN <> 0 
-            THEN (sh.CLOSE - sh.OPEN) / sh.OPEN 
-            ELSE NULL 
-        END                            AS DAILY_RETURN,
-
-        -- Change vs previous close
-        sh.CLOSE 
+        sh.CLOSE
         - LAG(sh.CLOSE) OVER (
             PARTITION BY dc.COMPANY_KEY
             ORDER BY dd.FULL_DATE
-          )                             AS CHANGES,
+        ) AS CHANGES,
 
-        -- 7-day moving average (close)
         AVG(sh.CLOSE) OVER (
             PARTITION BY dc.COMPANY_KEY
             ORDER BY dd.FULL_DATE
             ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
-        )                               AS MA_7,
+        ) AS MA_7,
 
-        -- 30-day moving average (close)
         AVG(sh.CLOSE) OVER (
             PARTITION BY dc.COMPANY_KEY
             ORDER BY dd.FULL_DATE
             ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
-        )                               AS MA_30,
+        ) AS MA_30,
 
-        -- 7-day rolling average volume
         AVG(sh.VOLUME) OVER (
             PARTITION BY dc.COMPANY_KEY
             ORDER BY dd.FULL_DATE
             ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
-        )                               AS VOLAVG
+        ) AS VOLAVG
+
     FROM STG_STOCK_HISTORY sh
     JOIN DIM_DATE dd
       ON sh.DATE = dd.FULL_DATE

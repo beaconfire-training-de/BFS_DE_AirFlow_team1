@@ -29,7 +29,22 @@ with DAG(
     load_fact = SnowflakeOperator(
         task_id="load_fact",
         snowflake_conn_id="jan_airflow_snowflake",
-        sql="""CREATE OR REPLACE TABLE AIRFLOW0105.DEV.dim_Date_1 (
+        sql="""-- ============================================================
+-- Stock Data Warehouse - Star Schema
+-- Team 1 - Snowflake SQL DDL Scripts
+-- Database: AIRFLOW0105
+-- Schema: DEV
+-- ============================================================
+
+-- Set the context
+USE DATABASE AIRFLOW0105;
+USE SCHEMA DEV;
+
+-- ============================================================
+-- 1. DIMENSION TABLE: dim_Date_1
+-- Source: Generated date dimension (not from source tables)
+-- ============================================================
+CREATE OR REPLACE TABLE AIRFLOW0105.DEV.dim_Date_1 (
     date_key        INT             PRIMARY KEY,        -- Surrogate key (YYYYMMDD format)
     full_date       DATE            NOT NULL,           -- Full date value
     year            INT             NOT NULL,           -- Year (e.g., 2026)
@@ -192,7 +207,105 @@ SELECT
     swc.daily_change
 FROM stock_with_calculations swc
 INNER JOIN AIRFLOW0105.DEV.dim_Date_1 d ON TO_NUMBER(TO_CHAR(swc.DATE, 'YYYYMMDD')) = d.date_key
-LEFT JOIN AIRFLOW0105.DEV.dim_Company_1 c ON swc.SYMBOL = c.symbol;"""
+LEFT JOIN AIRFLOW0105.DEV.dim_Company_1 c ON swc.SYMBOL = c.symbol;
+
+-- Incremental data for  dim_Company_1
+MERGE INTO AIRFLOW0105.DEV.dim_Company_1 AS target
+USING (
+    SELECT DISTINCT
+        u1.SYMBOL,
+        u1.NAME AS company_name,
+        u2.CEO,
+        u2.SECTOR,
+        u2.INDUSTRY,
+        u1.EXCHANGE,
+        u2.WEBSITE,
+        u2.BETA,
+        u2.MKTCAP,
+        u2.DESCRIPTION
+    FROM US_STOCK_DAILY.DCCM.SYMBOLS u1
+    LEFT JOIN US_STOCK_DAILY.DCCM.COMPANY_PROFILE u2
+        ON u1.SYMBOL = u2.SYMBOL
+) AS source
+ON target.symbol = source.SYMBOL
+-- if mached then update
+WHEN MATCHED THEN UPDATE SET
+    target.company_name = source.company_name,
+    target.ceo = source.CEO,
+    target.sector = source.SECTOR,
+    target.industry = source.INDUSTRY,
+    target.exchange = source.EXCHANGE,
+    target.website = source.WEBSITE,
+    target.beta = source.BETA,
+    target.mktcap = source.MKTCAP,
+    target.description = source.DESCRIPTION
+-- if not，insert new
+WHEN NOT MATCHED THEN INSERT (symbol, company_name, ceo, sector, industry, exchange, website, beta, mktcap, description)
+VALUES (source.SYMBOL, source.company_name, source.CEO, source.SECTOR, source.INDUSTRY, source.EXCHANGE, source.WEBSITE, source.BETA, source.MKTCAP, source.DESCRIPTION);
+
+-- 增量加载 fact_Stock_Daily_1
+-- 方法：只加载比目标表中最新日期更新的数据
+
+MERGE INTO AIRFLOW0105.DEV.fact_Stock_Daily_1 AS target
+USING (
+    WITH stock_with_calculations AS (
+        SELECT
+            sh.SYMBOL,
+            sh.DATE,
+            sh.OPEN,
+            sh.HIGH,
+            sh.LOW,
+            sh.CLOSE,
+            sh.ADJCLOSE,
+            sh.VOLUME,
+            cp.VOLAVG,
+            cp.CHANGES,
+            AVG(sh.CLOSE) OVER (
+                PARTITION BY sh.SYMBOL 
+                ORDER BY sh.DATE 
+                ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+            ) AS ma_7,
+            AVG(sh.CLOSE) OVER (
+                PARTITION BY sh.SYMBOL 
+                ORDER BY sh.DATE 
+                ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+            ) AS ma_30,
+            (sh.CLOSE - LAG(sh.CLOSE) OVER (PARTITION BY sh.SYMBOL ORDER BY sh.DATE)) 
+                / NULLIF(LAG(sh.CLOSE) OVER (PARTITION BY sh.SYMBOL ORDER BY sh.DATE), 0) AS daily_return,
+            sh.CLOSE - LAG(sh.CLOSE) OVER (PARTITION BY sh.SYMBOL ORDER BY sh.DATE) AS daily_change
+        FROM US_STOCK_DAILY.DCCM.STOCK_HISTORY sh
+        LEFT JOIN US_STOCK_DAILY.DCCM.COMPANY_PROFILE cp ON sh.SYMBOL = cp.SYMBOL
+        -- 只选择新数据（比目标表最新日期更新的）
+        WHERE sh.DATE > (SELECT COALESCE(MAX(d.full_date), '1900-01-01') 
+                         FROM AIRFLOW0105.DEV.fact_Stock_Daily_1 f
+                         JOIN AIRFLOW0105.DEV.dim_Date_1 d ON f.date_key = d.date_key)
+    )
+    SELECT
+        d.date_key,
+        c.company_key,
+        swc.*
+    FROM stock_with_calculations swc
+    INNER JOIN AIRFLOW0105.DEV.dim_Date_1 d ON TO_NUMBER(TO_CHAR(swc.DATE, 'YYYYMMDD')) = d.date_key
+    LEFT JOIN AIRFLOW0105.DEV.dim_Company_1 c ON swc.SYMBOL = c.symbol
+) AS source
+ON target.date_key = source.date_key AND target.company_key = source.company_key
+-- 如果匹配到（同一天同一股票），更新数据
+WHEN MATCHED THEN UPDATE SET
+    target.open_price = source.OPEN,
+    target.high_price = source.HIGH,
+    target.low_price = source.LOW,
+    target.close_price = source.CLOSE,
+    target.adj_close = source.ADJCLOSE,
+    target.volume = source.VOLUME,
+    target.volavg = source.VOLAVG,
+    target.changes = source.CHANGES,
+    target.ma_7 = source.ma_7,
+    target.ma_30 = source.ma_30,
+    target.daily_return = source.daily_return,
+    target.daily_change = source.daily_change
+-- 如果没匹配到，插入新数据
+WHEN NOT MATCHED THEN INSERT (date_key, company_key, open_price, high_price, low_price, close_price, adj_close, volume, volavg, changes, ma_7, ma_30, daily_return, daily_change)
+VALUES (source.date_key, source.company_key, source.OPEN, source.HIGH, source.LOW, source.CLOSE, source.ADJCLOSE, source.VOLUME, source.VOLAVG, source.CHANGES, source.ma_7, source.ma_30, source.daily_return, source.daily_change);"""
     )
 
     SQL_VALIDATE_ROW_COUNTS = """

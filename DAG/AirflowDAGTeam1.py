@@ -17,7 +17,7 @@ default_args = {
 }
 
 with DAG(
-    dag_id=f"project1_stock_dimensional_etl_{team1}",
+    dag_id=f"project1_stock_dimensional_etl_{GROUP_NUM}",
     start_date=datetime(2024, 1, 1),
     schedule_interval="@daily",   # daily trigger
     catchup=False,

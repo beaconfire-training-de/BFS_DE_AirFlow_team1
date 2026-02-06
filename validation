@@ -1,0 +1,92 @@
+from airflow.decorators import task
+from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+import logging
+
+@task
+def validate_stock_data_warehouse():
+    """
+    Validate the stock data warehouse after loading
+    """
+    hook = SnowflakeHook(snowflake_conn_id='snowflake_conn')
+    
+    validation_results = {}
+    
+    # 1. Row Count Validation
+    row_counts = hook.get_first("""
+        SELECT 
+            (SELECT COUNT(*) FROM AIRFLOW0105.DEV.dim_Date_1) as date_count,
+            (SELECT COUNT(*) FROM AIRFLOW0105.DEV.dim_Company_1) as company_count,
+            (SELECT COUNT(*) FROM AIRFLOW0105.DEV.fact_Stock_Daily_1) as fact_count
+    """)
+    
+    validation_results['row_counts'] = {
+        'dim_Date_1': row_counts[0],
+        'dim_Company_1': row_counts[1],
+        'fact_Stock_Daily_1': row_counts[2]
+    }
+    
+    logging.info(f"Row counts: {validation_results['row_counts']}")
+    
+    # 2. Date Dimension Validation
+    date_checks = hook.get_first("""
+        SELECT 
+            COUNT(DISTINCT date_key) as unique_dates,
+            MIN(full_date) as min_date,
+            MAX(full_date) as max_date,
+            COUNT(CASE WHEN date_key != TO_NUMBER(TO_CHAR(full_date, 'YYYYMMDD')) THEN 1 END) as date_key_mismatch
+        FROM AIRFLOW0105.DEV.dim_Date_1
+    """)
+    
+    validation_results['date_dimension'] = {
+        'unique_dates': date_checks[0],
+        'min_date': date_checks[1],
+        'max_date': date_checks[2],
+        'date_key_mismatch': date_checks[3]
+    }
+    
+    assert date_checks[3] == 0, "Date key format mismatch found!"
+    
+    # 3. Company Dimension Validation
+    company_checks = hook.get_first("""
+        SELECT 
+            COUNT(DISTINCT symbol) as unique_symbols,
+            COUNT(*) - COUNT(DISTINCT symbol) as duplicate_symbols,
+            COUNT(*) - COUNT(company_name) as null_company_names,
+            COUNT(*) - COUNT(sector) as null_sectors
+        FROM AIRFLOW0105.DEV.dim_Company_1
+    """)
+    
+    validation_results['company_dimension'] = {
+        'unique_symbols': company_checks[0],
+        'duplicate_symbols': company_checks[1],
+        'null_company_names': company_checks[2],
+        'null_sectors': company_checks[3]
+    }
+    
+    assert company_checks[1] == 0, "Duplicate symbols found in dim_Company_1!"
+    
+    # 4. Fact Table Validation
+    fact_checks = hook.get_first("""
+        SELECT 
+            COUNT(*) as total_records,
+            COUNT(DISTINCT date_key) as unique_dates,
+            COUNT(DISTINCT company_key) as unique_companies,
+            COUNT(*) - COUNT(company_key) as null_company_keys,
+            COUNT(CASE WHEN open_price IS NULL OR close_price IS NULL THEN 1 END) as null_prices,
+            COUNT(CASE WHEN volume < 0 THEN 1 END) as negative_volumes,
+            COUNT(CASE WHEN close_price < 0 THEN 1 END) as negative_prices
+        FROM AIRFLOW0105.DEV.fact_Stock_Daily_1
+    """)
+    
+    validation_results['fact_table'] = {
+        'total_records': fact_checks[0],
+        'unique_dates': fact_checks[1],
+        'unique_companies': fact_checks[2],
+        'null_company_keys': fact_checks[3],
+        'null_prices': fact_checks[4],
+        'negative_volumes': fact_checks[5],
+        'negative_prices': fact_checks[6]
+    }
+    
+    assert fact_checks[5] == 0, "Negative volumes found!"
+    assert fact_checks[6] == 0, "Negative prices found!"

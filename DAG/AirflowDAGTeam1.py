@@ -23,94 +23,7 @@ default_args = {
 
 
 
-@task
-def validate_stock_data_warehouse():
-    """
-    Validate the stock data warehouse after loading
-    """
-    hook = SnowflakeHook(snowflake_conn_id='jan_airflow_snowflake')
-    
-    validation_results = {}
-    
-    # 1. Row Count Validation
-    row_counts = hook.get_first("""
-        SELECT 
-            (SELECT COUNT(*) FROM AIRFLOW0105.DEV.dim_Date_1) as date_count,
-            (SELECT COUNT(*) FROM AIRFLOW0105.DEV.dim_Company_1) as company_count,
-            (SELECT COUNT(*) FROM AIRFLOW0105.DEV.fact_Stock_Daily_1) as fact_count
-    """)
-    
-    validation_results['row_counts'] = {
-        'dim_Date_1': row_counts[0],
-        'dim_Company_1': row_counts[1],
-        'fact_Stock_Daily_1': row_counts[2]
-    }
-    
-    logging.info(f"Row counts: {validation_results['row_counts']}")
-    
-    # 2. Date Dimension Validation
-    date_checks = hook.get_first("""
-        SELECT 
-            COUNT(DISTINCT date_key) as unique_dates,
-            MIN(full_date) as min_date,
-            MAX(full_date) as max_date,
-            COUNT(CASE WHEN date_key != TO_NUMBER(TO_CHAR(full_date, 'YYYYMMDD')) THEN 1 END) as date_key_mismatch
-        FROM AIRFLOW0105.DEV.dim_Date_1
-    """)
-    
-    validation_results['date_dimension'] = {
-        'unique_dates': date_checks[0],
-        'min_date': date_checks[1],
-        'max_date': date_checks[2],
-        'date_key_mismatch': date_checks[3]
-    }
-    
-    assert date_checks[3] == 0, "Date key format mismatch found!"
-    
-    # 3. Company Dimension Validation
-    company_checks = hook.get_first("""
-        SELECT 
-            COUNT(DISTINCT symbol) as unique_symbols,
-            COUNT(*) - COUNT(DISTINCT symbol) as duplicate_symbols,
-            COUNT(*) - COUNT(company_name) as null_company_names,
-            COUNT(*) - COUNT(sector) as null_sectors
-        FROM AIRFLOW0105.DEV.dim_Company_1
-    """)
-    
-    validation_results['company_dimension'] = {
-        'unique_symbols': company_checks[0],
-        'duplicate_symbols': company_checks[1],
-        'null_company_names': company_checks[2],
-        'null_sectors': company_checks[3]
-    }
-    
-    assert company_checks[1] == 0, "Duplicate symbols found in dim_Company_1!"
-    
-    # 4. Fact Table Validation
-    fact_checks = hook.get_first("""
-        SELECT 
-            COUNT(*) as total_records,
-            COUNT(DISTINCT date_key) as unique_dates,
-            COUNT(DISTINCT company_key) as unique_companies,
-            COUNT(*) - COUNT(company_key) as null_company_keys,
-            COUNT(CASE WHEN open_price IS NULL OR close_price IS NULL THEN 1 END) as null_prices,
-            COUNT(CASE WHEN volume < 0 THEN 1 END) as negative_volumes,
-            COUNT(CASE WHEN close_price < 0 THEN 1 END) as negative_prices
-        FROM AIRFLOW0105.DEV.fact_Stock_Daily_1
-    """)
-    
-    validation_results['fact_table'] = {
-        'total_records': fact_checks[0],
-        'unique_dates': fact_checks[1],
-        'unique_companies': fact_checks[2],
-        'null_company_keys': fact_checks[3],
-        'null_prices': fact_checks[4],
-        'negative_volumes': fact_checks[5],
-        'negative_prices': fact_checks[6]
-    }
-    
-    assert fact_checks[5] == 0, "Negative volumes found!"
-    assert fact_checks[6] == 0, "Negative prices found!"
+
 
 with DAG(
     dag_id=f"project1_stock_dimensional_etl_{GROUP_NUM}",
@@ -403,83 +316,209 @@ WHEN MATCHED THEN UPDATE SET
 WHEN NOT MATCHED THEN INSERT (date_key, company_key, open_price, high_price, low_price, close_price, adj_close, volume, volavg, changes, ma_7, ma_30, daily_return, daily_change)
 VALUES (source.date_key, source.company_key, source.OPEN, source.HIGH, source.LOW, source.CLOSE, source.ADJCLOSE, source.VOLUME, source.VOLAVG, source.CHANGES, source.ma_7, source.ma_30, source.daily_return, source.daily_change);"""
     )
-
-    SQL_VALIDATE_ROW_COUNTS = """
-                              -- Validation: Check row counts
-                              SELECT 'dim_company_QA_v3 (total)' AS table_name, COUNT(*) AS row_count \
-                              FROM AIRFLOW0105.DEV.dim_company_QA_v3
-                              UNION ALL
-                              SELECT 'dim_company_QA_v3 (current)' AS table_name, COUNT(*) AS row_count \
-                              FROM AIRFLOW0105.DEV.dim_company_QA_v3 \
-                              WHERE is_current = TRUE
-                              UNION ALL
-                              SELECT 'dim_company_QA_v3 (historical)' AS table_name, COUNT(*) AS row_count \
-                              FROM AIRFLOW0105.DEV.dim_company_QA_v3 \
-                              WHERE is_current = FALSE
-                              UNION ALL
-                              SELECT 'dim_date_QA_v3' AS table_name, COUNT(*) AS row_count \
-                              FROM AIRFLOW0105.DEV.dim_date_QA_v3
-                              UNION ALL
-                              SELECT 'fact_stock_daily_QA_v3' AS table_name, COUNT(*) AS row_count \
-                              FROM AIRFLOW0105.DEV.fact_stock_daily_QA_v3
-                              UNION ALL
-                              SELECT 'source_symbols' AS table_name, COUNT(*) AS row_count \
-                              FROM US_STOCK_DAILY.DCCM.Symbols
-                              UNION ALL
-                              SELECT 'source_stock_history' AS table_name, COUNT(*) AS row_count \
-                              FROM US_STOCK_DAILY.DCCM.Stock_History; \
-                              """
-
-    SQL_VALIDATE_REFERENTIAL_INTEGRITY = """
-                                         -- Validation: Check for orphan records in fact table
-                                         SELECT 'orphan_company_keys' AS check_name, \
-                                                COUNT(*)              AS orphan_count
-                                         FROM AIRFLOW0105.DEV.fact_stock_daily_QA_v3 f
-                                                  LEFT JOIN AIRFLOW0105.DEV.dim_company_QA_v3 c ON f.company_key = c.company_key
-                                         WHERE c.company_key IS NULL
-
-                                         UNION ALL
-
-                                         SELECT 'orphan_date_keys' AS check_name, \
-                                                COUNT(*)           AS orphan_count
-                                         FROM AIRFLOW0105.DEV.fact_stock_daily_QA_v3 f
-                                                  LEFT JOIN AIRFLOW0105.DEV.dim_date_QA_v3 d ON f.date_key = d.date_key
-                                         WHERE d.date_key IS NULL; \
-                                         """
-
-    SQL_VALIDATE_SCD2 = """
-    -- Validation: Check SCD Type 2 integrity
-    -- Each symbol should have exactly one current record
-    SELECT 
-        'symbols_with_multiple_current' AS check_name,
-        COUNT(*) AS issue_count
-    FROM (
-        SELECT symbol, COUNT(*) as cnt
-        FROM AIRFLOW0105.DEV.dim_company_QA_v3
-        WHERE is_current = TRUE
-        GROUP BY symbol
-        HAVING COUNT(*) > 1
-    )
-    UNION ALL
-    SELECT 
-        'symbols_with_no_current' AS check_name,
-        COUNT(*) AS issue_count
-    FROM (
-        SELECT DISTINCT symbol 
-        FROM AIRFLOW0105.DEV.dim_company_QA_v3
-        WHERE symbol NOT IN (
-            SELECT symbol FROM AIRFLOW0105.DEV.dim_company_QA_v3 WHERE is_current = TRUE
-        )
-    );
+# ============================================================
+# VALIDATION FUNCTION - Top 5 Critical Checks
+# ============================================================
+@task
+def validate_stock_data_warehouse():
     """
+    Validate the stock data warehouse after loading
+    Includes 5 critical data quality checks
+    """
+    hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+    validation_results = {}
+    
+    # ============================================================
+    # 1. ROW COUNT VALIDATION
+    # ============================================================
+    logging.info("=" * 60)
+    logging.info("Validation 1/5: Row Count Check")
+    logging.info("=" * 60)
+    
+    row_counts = hook.get_first("""
+        SELECT 
+            (SELECT COUNT(*) FROM AIRFLOW0105.DEV.dim_Date_1) as date_count,
+            (SELECT COUNT(*) FROM AIRFLOW0105.DEV.dim_Company_1) as company_count,
+            (SELECT COUNT(*) FROM AIRFLOW0105.DEV.fact_Stock_Daily_1) as fact_count
+    """)
+    
+    validation_results['row_counts'] = {
+        'dim_Date_1': row_counts[0],
+        'dim_Company_1': row_counts[1],
+        'fact_Stock_Daily_1': row_counts[2]
+    }
+    
+    logging.info(f"✓ dim_Date_1: {row_counts[0]:,} rows")
+    logging.info(f"✓ dim_Company_1: {row_counts[1]:,} rows")
+    logging.info(f"✓ fact_Stock_Daily_1: {row_counts[2]:,} rows")
+    
+    assert row_counts[0] > 0, "❌ FAILED: Date dimension is empty!"
+    assert row_counts[1] > 0, "❌ FAILED: Company dimension is empty!"
+    assert row_counts[2] > 0, "❌ FAILED: Fact table is empty!"
+    
+    # ============================================================
+    # 2. DATE DIMENSION VALIDATION
+    # ============================================================
+    logging.info("\n" + "=" * 60)
+    logging.info("Validation 2/5: Date Dimension Integrity")
+    logging.info("=" * 60)
+    
+    date_checks = hook.get_first("""
+        SELECT 
+            COUNT(DISTINCT date_key) as unique_dates,
+            MIN(full_date) as min_date,
+            MAX(full_date) as max_date,
+            COUNT(CASE WHEN date_key != TO_NUMBER(TO_CHAR(full_date, 'YYYYMMDD')) THEN 1 END) as date_key_mismatch
+        FROM AIRFLOW0105.DEV.dim_Date_1
+    """)
+    
+    validation_results['date_dimension'] = {
+        'unique_dates': date_checks[0],
+        'min_date': str(date_checks[1]),
+        'max_date': str(date_checks[2]),
+        'date_key_mismatch': date_checks[3]
+    }
+    
+    logging.info(f"✓ Unique dates: {date_checks[0]:,}")
+    logging.info(f"✓ Date range: {date_checks[1]} to {date_checks[2]}")
+    logging.info(f"✓ Date key format mismatches: {date_checks[3]}")
+    
+    assert date_checks[3] == 0, f"❌ FAILED: Found {date_checks[3]} date key format mismatches!"
+    
+    # ============================================================
+    # 3. COMPANY DIMENSION VALIDATION
+    # ============================================================
+    logging.info("\n" + "=" * 60)
+    logging.info("Validation 3/5: Company Dimension Uniqueness")
+    logging.info("=" * 60)
+    
+    company_checks = hook.get_first("""
+        SELECT 
+            COUNT(DISTINCT symbol) as unique_symbols,
+            COUNT(*) - COUNT(DISTINCT symbol) as duplicate_symbols,
+            COUNT(*) - COUNT(company_name) as null_company_names,
+            COUNT(*) - COUNT(sector) as null_sectors
+        FROM AIRFLOW0105.DEV.dim_Company_1
+    """)
+    
+    validation_results['company_dimension'] = {
+        'unique_symbols': company_checks[0],
+        'duplicate_symbols': company_checks[1],
+        'null_company_names': company_checks[2],
+        'null_sectors': company_checks[3]
+    }
+    
+    logging.info(f"✓ Unique symbols: {company_checks[0]:,}")
+    logging.info(f"✓ Duplicate symbols: {company_checks[1]}")
+    logging.info(f"✓ NULL company names: {company_checks[2]}")
+    logging.info(f"✓ NULL sectors: {company_checks[3]}")
+    
+    assert company_checks[1] == 0, f"❌ FAILED: Found {company_checks[1]} duplicate symbols!"
+    
+    # ============================================================
+    # 4. FACT TABLE VALIDATION
+    # ============================================================
+    logging.info("\n" + "=" * 60)
+    logging.info("Validation 4/5: Fact Table Data Quality")
+    logging.info("=" * 60)
+    
+    fact_checks = hook.get_first("""
+        SELECT 
+            COUNT(*) as total_records,
+            COUNT(DISTINCT date_key) as unique_dates,
+            COUNT(DISTINCT company_key) as unique_companies,
+            COUNT(*) - COUNT(company_key) as null_company_keys,
+            COUNT(CASE WHEN open_price IS NULL OR close_price IS NULL THEN 1 END) as null_prices,
+            COUNT(CASE WHEN volume < 0 THEN 1 END) as negative_volumes,
+            COUNT(CASE WHEN close_price < 0 THEN 1 END) as negative_prices
+        FROM AIRFLOW0105.DEV.fact_Stock_Daily_1
+    """)
+    
+    validation_results['fact_table'] = {
+        'total_records': fact_checks[0],
+        'unique_dates': fact_checks[1],
+        'unique_companies': fact_checks[2],
+        'null_company_keys': fact_checks[3],
+        'null_prices': fact_checks[4],
+        'negative_volumes': fact_checks[5],
+        'negative_prices': fact_checks[6]
+    }
+    
+    logging.info(f"✓ Total records: {fact_checks[0]:,}")
+    logging.info(f"✓ Unique dates: {fact_checks[1]:,}")
+    logging.info(f"✓ Unique companies: {fact_checks[2]:,}")
+    logging.info(f"✓ NULL company keys: {fact_checks[3]:,}")
+    logging.info(f"✓ NULL prices: {fact_checks[4]}")
+    logging.info(f"✓ Negative volumes: {fact_checks[5]}")
+    logging.info(f"✓ Negative prices: {fact_checks[6]}")
+    
+    assert fact_checks[4] == 0, f"❌ FAILED: Found {fact_checks[4]} records with NULL prices!"
+    assert fact_checks[5] == 0, f"❌ FAILED: Found {fact_checks[5]} records with negative volumes!"
+    assert fact_checks[6] == 0, f"❌ FAILED: Found {fact_checks[6]} records with negative prices!"
+    
+    # ============================================================
+    # 5. REFERENTIAL INTEGRITY CHECK
+    # ============================================================
+    logging.info("\n" + "=" * 60)
+    logging.info("Validation 5/5: Referential Integrity")
+    logging.info("=" * 60)
+    
+    orphan_dates = hook.get_first("""
+        SELECT COUNT(*)
+        FROM AIRFLOW0105.DEV.fact_Stock_Daily_1 f
+        LEFT JOIN AIRFLOW0105.DEV.dim_Date_1 d ON f.date_key = d.date_key
+        WHERE d.date_key IS NULL
+    """)
+    
+    orphan_companies = hook.get_first("""
+        SELECT COUNT(*)
+        FROM AIRFLOW0105.DEV.fact_Stock_Daily_1 f
+        LEFT JOIN AIRFLOW0105.DEV.dim_Company_1 c ON f.company_key = c.company_key
+        WHERE f.company_key IS NOT NULL AND c.company_key IS NULL
+    """)
+    
+    validation_results['referential_integrity'] = {
+        'orphan_dates': orphan_dates[0],
+        'orphan_companies': orphan_companies[0]
+    }
+    
+    logging.info(f"✓ Orphan date keys: {orphan_dates[0]}")
+    logging.info(f"✓ Orphan company keys: {orphan_companies[0]}")
+    
+    assert orphan_dates[0] == 0, f"❌ FAILED: Found {orphan_dates[0]} orphan date keys!"
+    assert orphan_companies[0] == 0, f"❌ FAILED: Found {orphan_companies[0]} orphan company keys!"
+    
+    # ============================================================
+    # FINAL SUMMARY
+    # ============================================================
+    logging.info("\n" + "=" * 60)
+    logging.info("✅ ALL 5 VALIDATIONS PASSED!")
+    logging.info("=" * 60)
+    
+    return validation_results
 
-    validate = SnowflakeOperator(
-        task_id="validate",
-        snowflake_conn_id="jan_airflow_snowflake",
-        sql=SQL_VALIDATE_ROW_COUNTS
+
+# ============================================================
+# DAG DEFINITION
+# ============================================================
+with DAG(
+    dag_id=f"project1_stock_dimensional_etl_{GROUP_NUM}",
+    start_date=datetime(2024, 1, 1),
+    schedule_interval="@daily",
+    catchup=False,
+    default_args=default_args,
+    tags=["project1", "snowflake", "stock", "team1", 'etl', 'dwh'],
+) as dag:
+
+    load_fact = SnowflakeOperator(
+        task_id="load_fact",
+        snowflake_conn_id=SNOWFLAKE_CONN_ID,
+        sql="""-- Your existing ETL SQL here
+        -- (Keep your original SQL from the document)
+        """
     )
-   
 
     
     taskflow_validate = validate_stock_data_warehouse()
+
     load_fact >> taskflow_validate

@@ -316,26 +316,6 @@ VALUES (source.date_key, source.company_key, source.OPEN, source.HIGH, source.LO
     )
 
 
-# ============================================================
-# DAG DEFINITION
-# ============================================================
-with DAG(
-    dag_id=f"project1_stock_dimensional_etl_{GROUP_NUM}",
-    start_date=datetime(2024, 1, 1),
-    schedule_interval="@daily",
-    catchup=False,
-    default_args=default_args,
-    tags=["project1", "snowflake", "stock", "team1", 'etl', 'dwh'],
-) as dag:
-
-    load_fact = SnowflakeOperator(
-        task_id="load_fact",
-        snowflake_conn_id=SNOWFLAKE_CONN_ID,
-        sql="""-- Your existing ETL SQL here
-        -- (Keep your original SQL from the document)
-        """
-    )
-
     
 
     load_fact

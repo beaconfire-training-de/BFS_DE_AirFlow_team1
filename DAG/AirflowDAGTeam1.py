@@ -382,7 +382,7 @@ VALUES (source.date_key, source.company_key, source.OPEN, source.HIGH, source.LO
         snowflake_conn_id="jan_airflow_snowflake",
         sql=SQL_VALIDATE_ROW_COUNTS
     )
-    load_fact >> validate
+   
 
 from airflow.decorators import task
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
@@ -393,7 +393,7 @@ def validate_stock_data_warehouse():
     """
     Validate the stock data warehouse after loading
     """
-    hook = SnowflakeHook(snowflake_conn_id='snowflake_conn')
+    hook = SnowflakeHook(snowflake_conn_id='jan_airflow_snowflake')
     
     validation_results = {}
     
@@ -476,3 +476,6 @@ def validate_stock_data_warehouse():
     
     assert fact_checks[5] == 0, "Negative volumes found!"
     assert fact_checks[6] == 0, "Negative prices found!"
+    
+    taskflow_validate = validate_stock_data_warehouse()
+    load_fact >> taskflow_validate

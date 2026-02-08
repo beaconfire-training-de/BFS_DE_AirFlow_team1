@@ -209,7 +209,7 @@ USING (
   JOIN DIM_SECURITY_{GROUP_NUM.upper()} ds
     ON ds.SYMBOL = sh.SYMBOL
   JOIN DIM_DATE_{GROUP_NUM.upper()} dd
-    ON_hold dd.FULL_DATE = sh.DATE
+    on dd.FULL_DATE = sh.DATE
 ) src
 ON tgt.SECURITY_KEY = src.SECURITY_KEY
 AND tgt.DATE_KEY     = src.DATE_KEY

@@ -7,20 +7,31 @@ Runs a single end-to-end ETL in Snowflake:
 3) Upsert DIM_SECURITY (SYMBOLS + COMPANY_PROFILE descriptive)
 4) Merge FACT_STOCK_DAILY (STOCK_HISTORY)
 5) Merge FACT_SECURITY_SNAPSHOT (COMPANY_PROFILE metrics snapshot as-of today)
-6) Validation queries (row counts, orphan checks, dup checks)
+6) SQL validate (may fail) + Python tests (never fail, only log)
 
 Connection:
 SNOWFLAKE_CONN_ID = "jan_airflow_snowflake"
 """
 
 from datetime import datetime, timedelta
+import logging
 
 from airflow import DAG
+from airflow.decorators import task
 from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
+from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
 
 GROUP_NUM = "team1"
 SNOWFLAKE_CONN_ID = "jan_airflow_snowflake"
+
+DB = "AIRFLOW0105"
+SCHEMA = "DEV"
+
+DIM_DATE_TBL = f"{DB}.{SCHEMA}.DIM_DATE_{GROUP_NUM.upper()}"
+DIM_SECURITY_TBL = f"{DB}.{SCHEMA}.DIM_SECURITY_{GROUP_NUM.upper()}"
+FACT_DAILY_TBL = f"{DB}.{SCHEMA}.FACT_STOCK_DAILY_{GROUP_NUM.upper()}"
+FACT_SNAP_TBL = f"{DB}.{SCHEMA}.FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()}"
 
 # -----------------------------
 # SQL: DDL
@@ -272,67 +283,12 @@ WHEN NOT MATCHED THEN INSERT (
 """
 
 # -----------------------------
-# SQL: Validations (fail DAG if bad)
-# SnowflakeOperator will fail if any statement errors; to "fail on bad data",
-# we turn bad conditions into errors using division by zero / assert-like patterns.
+# SQL: Validations (can fail DAG)
 # -----------------------------
 SQL_VALIDATE = f"""
 USE DATABASE AIRFLOW0105;
 USE SCHEMA DEV;
 
--- Compute all validation counts in one row
-WITH
-orphan_security_daily AS (
-  SELECT COUNT(*) AS c
-  FROM FACT_STOCK_DAILY_TEAM1 f
-  LEFT JOIN DIM_SECURITY_TEAM1 d
-    ON f.SECURITY_KEY = d.SECURITY_KEY
-  WHERE d.SECURITY_KEY IS NULL
-),
-orphan_date_daily AS (
-  SELECT COUNT(*) AS c
-  FROM FACT_STOCK_DAILY_TEAM1 f
-  LEFT JOIN DIM_DATE_TEAM1 d
-    ON f.DATE_KEY = d.DATE_KEY
-  WHERE d.DATE_KEY IS NULL
-),
-orphan_date_snapshot AS (
-  SELECT COUNT(*) AS c
-  FROM FACT_SECURITY_SNAPSHOT_TEAM1 s
-  LEFT JOIN DIM_DATE_TEAM1 d
-    ON s.ASOF_DATE_KEY = d.DATE_KEY
-  WHERE d.DATE_KEY IS NULL
-),
-dup_daily AS (
-  SELECT COUNT(*) AS c
-  FROM (
-    SELECT SECURITY_KEY, DATE_KEY
-    FROM FACT_STOCK_DAILY_TEAM1
-    GROUP BY 1,2
-    HAVING COUNT(*) > 1
-  )
-),
-dup_snapshot AS (
-  SELECT COUNT(*) AS c
-  FROM (
-    SELECT SECURITY_KEY, ASOF_DATE_KEY
-    FROM FACT_SECURITY_SNAPSHOT_TEAM1
-    GROUP BY 1,2
-    HAVING COUNT(*) > 1
-  )
-),
-checks AS (
-  SELECT
-    (SELECT c FROM orphan_security_daily) AS orphan_security_daily_cnt,
-    (SELECT c FROM orphan_date_daily)     AS orphan_date_daily_cnt,
-    (SELECT c FROM orphan_date_snapshot)  AS orphan_date_snapshot_cnt,
-    (SELECT c FROM dup_daily)             AS dup_daily_cnt,
-    (SELECT c FROM dup_snapshot)          AS dup_snapshot_cnt
-)
--- 1) Always print the counts (debug-friendly)
-SELECT * FROM checks;
-
--- 2) Fail if any count > 0 (but message will be in logs from above)
 WITH checks AS (
   SELECT
     (SELECT COUNT(*) FROM FACT_STOCK_DAILY_TEAM1 f
@@ -361,22 +317,222 @@ WITH checks AS (
       HAVING COUNT(*) > 1
     )) AS dup_snapshot_cnt
 )
+SELECT * FROM checks;
+
+WITH checks AS (
+  SELECT
+    (SELECT COUNT(*) FROM FACT_STOCK_DAILY_TEAM1 f
+      LEFT JOIN DIM_SECURITY_TEAM1 d ON f.SECURITY_KEY=d.SECURITY_KEY
+      WHERE d.SECURITY_KEY IS NULL) AS orphan_security_daily_cnt,
+    (SELECT COUNT(*) FROM FACT_STOCK_DAILY_TEAM1 f
+      LEFT JOIN DIM_DATE_TEAM1 d ON f.DATE_KEY=d.DATE_KEY
+      WHERE d.DATE_KEY IS NULL) AS orphan_date_daily_cnt,
+    (SELECT COUNT(*) FROM FACT_SECURITY_SNAPSHOT_TEAM1 s
+      LEFT JOIN DIM_DATE_TEAM1 d ON s.ASOF_DATE_KEY=d.DATE_KEY
+      WHERE d.DATE_KEY IS NULL) AS orphan_date_snapshot_cnt,
+    (SELECT COUNT(*) FROM (
+      SELECT SECURITY_KEY, DATE_KEY
+      FROM FACT_STOCK_DAILY_TEAM1
+      GROUP BY 1,2
+      HAVING COUNT(*) > 1
+    )) AS dup_daily_cnt,
+    (SELECT COUNT(*) FROM (
+      SELECT SECURITY_KEY, ASOF_DATE_KEY
+      FROM FACT_SECURITY_SNAPSHOT_TEAM1
+      GROUP BY 1,2
+      HAVING COUNT(*) > 1
+    )) AS dup_snapshot_cnt
+)
 SELECT
   CASE
     WHEN (orphan_security_daily_cnt + orphan_date_daily_cnt + orphan_date_snapshot_cnt + dup_daily_cnt + dup_snapshot_cnt) = 0
     THEN 1
-    ELSE 0  -- will throw a conversion error
+    ELSE TO_NUMBER('VALIDATION_FAILED')  -- throw error to fail
   END AS validation_status
 FROM checks;
 
--- 3) Row counts (optional info)
 SELECT
   (SELECT COUNT(*) FROM DIM_DATE_TEAM1)               AS dim_date_cnt,
   (SELECT COUNT(*) FROM DIM_SECURITY_TEAM1)           AS dim_security_cnt,
   (SELECT COUNT(*) FROM FACT_STOCK_DAILY_TEAM1)       AS fact_stock_daily_cnt,
   (SELECT COUNT(*) FROM FACT_SECURITY_SNAPSHOT_TEAM1) AS fact_security_snapshot_cnt;
-
 """
+
+# -----------------------------
+# Python Tests (never fail DAG; only log)
+# -----------------------------
+def _safe_fetchall(hook: SnowflakeHook, sql: str):
+    try:
+        return hook.get_records(sql) or []
+    except Exception as e:
+        logging.exception(f"[PYTEST] Query failed but continuing. Error={e}\nSQL:\n{sql}")
+        return []
+
+
+def _safe_fetchone(hook: SnowflakeHook, sql: str, default=0):
+    rows = _safe_fetchall(hook, sql)
+    if not rows or rows[0] is None or len(rows[0]) == 0:
+        return default
+    return rows[0][0]
+
+
+@task
+def pytest_row_counts():
+    hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+    sql = f"""
+      SELECT
+        (SELECT COUNT(*) FROM {DIM_DATE_TBL})     AS dim_date_cnt,
+        (SELECT COUNT(*) FROM {DIM_SECURITY_TBL}) AS dim_security_cnt,
+        (SELECT COUNT(*) FROM {FACT_DAILY_TBL})   AS fact_daily_cnt,
+        (SELECT COUNT(*) FROM {FACT_SNAP_TBL})    AS fact_snap_cnt
+    """
+    rows = _safe_fetchall(hook, sql)
+    logging.info(f"[PYTEST] Row counts: {rows[0] if rows else 'N/A'}")
+    return {"row_counts": rows[0] if rows else None}
+
+
+@task
+def pytest_orphans_and_dups(sample_n: int = 10):
+    hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+
+    orphan_security_daily_cnt = _safe_fetchone(hook, f"""
+      SELECT COUNT(*)
+      FROM {FACT_DAILY_TBL} f
+      LEFT JOIN {DIM_SECURITY_TBL} d ON f.SECURITY_KEY = d.SECURITY_KEY
+      WHERE d.SECURITY_KEY IS NULL
+    """)
+    orphan_security_daily_sample = _safe_fetchall(hook, f"""
+      SELECT f.SECURITY_KEY, f.DATE_KEY
+      FROM {FACT_DAILY_TBL} f
+      LEFT JOIN {DIM_SECURITY_TBL} d ON f.SECURITY_KEY = d.SECURITY_KEY
+      WHERE d.SECURITY_KEY IS NULL
+      LIMIT {sample_n}
+    """)
+
+    orphan_date_daily_cnt = _safe_fetchone(hook, f"""
+      SELECT COUNT(*)
+      FROM {FACT_DAILY_TBL} f
+      LEFT JOIN {DIM_DATE_TBL} d ON f.DATE_KEY = d.DATE_KEY
+      WHERE d.DATE_KEY IS NULL
+    """)
+    orphan_date_daily_sample = _safe_fetchall(hook, f"""
+      SELECT f.SECURITY_KEY, f.DATE_KEY
+      FROM {FACT_DAILY_TBL} f
+      LEFT JOIN {DIM_DATE_TBL} d ON f.DATE_KEY = d.DATE_KEY
+      WHERE d.DATE_KEY IS NULL
+      LIMIT {sample_n}
+    """)
+
+    orphan_date_snapshot_cnt = _safe_fetchone(hook, f"""
+      SELECT COUNT(*)
+      FROM {FACT_SNAP_TBL} s
+      LEFT JOIN {DIM_DATE_TBL} d ON s.ASOF_DATE_KEY = d.DATE_KEY
+      WHERE d.DATE_KEY IS NULL
+    """)
+    orphan_date_snapshot_sample = _safe_fetchall(hook, f"""
+      SELECT s.SECURITY_KEY, s.ASOF_DATE_KEY
+      FROM {FACT_SNAP_TBL} s
+      LEFT JOIN {DIM_DATE_TBL} d ON s.ASOF_DATE_KEY = d.DATE_KEY
+      WHERE d.DATE_KEY IS NULL
+      LIMIT {sample_n}
+    """)
+
+    dup_daily_cnt = _safe_fetchone(hook, f"""
+      SELECT COUNT(*) FROM (
+        SELECT SECURITY_KEY, DATE_KEY
+        FROM {FACT_DAILY_TBL}
+        GROUP BY 1,2
+        HAVING COUNT(*) > 1
+      )
+    """)
+    dup_daily_sample = _safe_fetchall(hook, f"""
+      SELECT SECURITY_KEY, DATE_KEY, COUNT(*) AS cnt
+      FROM {FACT_DAILY_TBL}
+      GROUP BY 1,2
+      HAVING COUNT(*) > 1
+      ORDER BY cnt DESC
+      LIMIT {sample_n}
+    """)
+
+    dup_snapshot_cnt = _safe_fetchone(hook, f"""
+      SELECT COUNT(*) FROM (
+        SELECT SECURITY_KEY, ASOF_DATE_KEY
+        FROM {FACT_SNAP_TBL}
+        GROUP BY 1,2
+        HAVING COUNT(*) > 1
+      )
+    """)
+    dup_snapshot_sample = _safe_fetchall(hook, f"""
+      SELECT SECURITY_KEY, ASOF_DATE_KEY, COUNT(*) AS cnt
+      FROM {FACT_SNAP_TBL}
+      GROUP BY 1,2
+      HAVING COUNT(*) > 1
+      ORDER BY cnt DESC
+      LIMIT {sample_n}
+    """)
+
+    summary = {
+        "orphan_security_daily_cnt": orphan_security_daily_cnt,
+        "orphan_date_daily_cnt": orphan_date_daily_cnt,
+        "orphan_date_snapshot_cnt": orphan_date_snapshot_cnt,
+        "dup_daily_cnt": dup_daily_cnt,
+        "dup_snapshot_cnt": dup_snapshot_cnt,
+    }
+
+    logging.info(f"[PYTEST] Validation summary (counts only): {summary}")
+    logging.info(f"[PYTEST] Sample orphan_security_daily: {orphan_security_daily_sample}")
+    logging.info(f"[PYTEST] Sample orphan_date_daily: {orphan_date_daily_sample}")
+    logging.info(f"[PYTEST] Sample orphan_date_snapshot: {orphan_date_snapshot_sample}")
+    logging.info(f"[PYTEST] Sample dup_daily: {dup_daily_sample}")
+    logging.info(f"[PYTEST] Sample dup_snapshot: {dup_snapshot_sample}")
+
+    return {"counts": summary, "samples": {
+        "orphan_security_daily": orphan_security_daily_sample,
+        "orphan_date_daily": orphan_date_daily_sample,
+        "orphan_date_snapshot": orphan_date_snapshot_sample,
+        "dup_daily": dup_daily_sample,
+        "dup_snapshot": dup_snapshot_sample,
+    }}
+
+
+@task
+def pytest_null_fks(sample_n: int = 10):
+    hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
+
+    null_fk_daily_cnt = _safe_fetchone(hook, f"""
+      SELECT COUNT(*)
+      FROM {FACT_DAILY_TBL}
+      WHERE SECURITY_KEY IS NULL OR DATE_KEY IS NULL
+    """)
+    null_fk_daily_sample = _safe_fetchall(hook, f"""
+      SELECT SECURITY_KEY, DATE_KEY, OPEN, HIGH, LOW, CLOSE, ADJCLOSE, VOLUME
+      FROM {FACT_DAILY_TBL}
+      WHERE SECURITY_KEY IS NULL OR DATE_KEY IS NULL
+      LIMIT {sample_n}
+    """)
+
+    null_fk_snap_cnt = _safe_fetchone(hook, f"""
+      SELECT COUNT(*)
+      FROM {FACT_SNAP_TBL}
+      WHERE SECURITY_KEY IS NULL OR ASOF_DATE_KEY IS NULL
+    """)
+    null_fk_snap_sample = _safe_fetchall(hook, f"""
+      SELECT SECURITY_KEY, ASOF_DATE_KEY, PRICE, BETA, VOLAVG, MKTCAP
+      FROM {FACT_SNAP_TBL}
+      WHERE SECURITY_KEY IS NULL OR ASOF_DATE_KEY IS NULL
+      LIMIT {sample_n}
+    """)
+
+    logging.info(f"[PYTEST] Null FK daily cnt={null_fk_daily_cnt}; sample={null_fk_daily_sample}")
+    logging.info(f"[PYTEST] Null FK snap  cnt={null_fk_snap_cnt}; sample={null_fk_snap_sample}")
+
+    return {
+        "null_fk_daily_cnt": null_fk_daily_cnt,
+        "null_fk_daily_sample": null_fk_daily_sample,
+        "null_fk_snap_cnt": null_fk_snap_cnt,
+        "null_fk_snap_sample": null_fk_snap_sample,
+    }
+
 
 default_args = {
     "owner": "team1",
@@ -425,10 +581,17 @@ with DAG(
         sql=SQL_MERGE_FACT_SECURITY_SNAPSHOT,
     )
 
+    # Keep SQL validate (may fail). If you want DAG to NEVER fail, comment this task + chain.
     validate = SnowflakeOperator(
         task_id="validate",
         snowflake_conn_id=SNOWFLAKE_CONN_ID,
         sql=SQL_VALIDATE,
     )
 
+    # Python tests (NEVER fail; only log)
+    t_py_row_counts = pytest_row_counts()
+    t_py_orphans_dups = pytest_orphans_and_dups(sample_n=10)
+    t_py_null_fks = pytest_null_fks(sample_n=10)
+
     create_tables >> load_dim_date >> upsert_dim_security >> merge_fact_stock_daily >> merge_fact_security_snapshot >> validate
+    validate >> t_py_row_counts >> t_py_orphans_dups >> t_py_null_fks

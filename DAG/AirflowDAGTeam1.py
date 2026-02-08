@@ -7,7 +7,7 @@ Runs a single end-to-end ETL in Snowflake:
 3) Upsert DIM_SECURITY (SYMBOLS + COMPANY_PROFILE descriptive)
 4) Merge FACT_STOCK_DAILY (STOCK_HISTORY)
 5) Merge FACT_SECURITY_SNAPSHOT (COMPANY_PROFILE metrics snapshot as-of today)
-6) SQL validate (may fail) + Python tests (never fail, only log)
+6) SQL validate (may fail) + Python tests (never fail, only log) + Branching based on XCom metrics
 
 Connection:
 SNOWFLAKE_CONN_ID = "jan_airflow_snowflake"
@@ -15,11 +15,15 @@ SNOWFLAKE_CONN_ID = "jan_airflow_snowflake"
 
 from datetime import datetime, timedelta
 import logging
+import json
 
 from airflow import DAG
 from airflow.decorators import task
 from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+
+from airflow.operators.python import BranchPythonOperator
+from airflow.operators.empty import EmptyOperator
 
 
 GROUP_NUM = "team1"
@@ -205,7 +209,7 @@ USING (
   JOIN DIM_SECURITY_{GROUP_NUM.upper()} ds
     ON ds.SYMBOL = sh.SYMBOL
   JOIN DIM_DATE_{GROUP_NUM.upper()} dd
-    ON dd.FULL_DATE = sh.DATE
+    ON_hold dd.FULL_DATE = sh.DATE
 ) src
 ON tgt.SECURITY_KEY = src.SECURITY_KEY
 AND tgt.DATE_KEY     = src.DATE_KEY
@@ -472,27 +476,28 @@ def pytest_orphans_and_dups(sample_n: int = 10):
     """)
 
     summary = {
-        "orphan_security_daily_cnt": orphan_security_daily_cnt,
-        "orphan_date_daily_cnt": orphan_date_daily_cnt,
-        "orphan_date_snapshot_cnt": orphan_date_snapshot_cnt,
-        "dup_daily_cnt": dup_daily_cnt,
-        "dup_snapshot_cnt": dup_snapshot_cnt,
+        "orphan_security_daily_cnt": int(orphan_security_daily_cnt),
+        "orphan_date_daily_cnt": int(orphan_date_daily_cnt),
+        "orphan_date_snapshot_cnt": int(orphan_date_snapshot_cnt),
+        "dup_daily_cnt": int(dup_daily_cnt),
+        "dup_snapshot_cnt": int(dup_snapshot_cnt),
     }
 
-    logging.info(f"[PYTEST] Validation summary (counts only): {summary}")
-    logging.info(f"[PYTEST] Sample orphan_security_daily: {orphan_security_daily_sample}")
-    logging.info(f"[PYTEST] Sample orphan_date_daily: {orphan_date_daily_sample}")
-    logging.info(f"[PYTEST] Sample orphan_date_snapshot: {orphan_date_snapshot_sample}")
-    logging.info(f"[PYTEST] Sample dup_daily: {dup_daily_sample}")
-    logging.info(f"[PYTEST] Sample dup_snapshot: {dup_snapshot_sample}")
+    # This return value goes to XCom automatically.
+    payload = {
+        "has_issues": any(v > 0 for v in summary.values()),
+        "counts": summary,
+        "samples": {
+            "orphan_security_daily": orphan_security_daily_sample,
+            "orphan_date_daily": orphan_date_daily_sample,
+            "orphan_date_snapshot": orphan_date_snapshot_sample,
+            "dup_daily": dup_daily_sample,
+            "dup_snapshot": dup_snapshot_sample,
+        },
+    }
 
-    return {"counts": summary, "samples": {
-        "orphan_security_daily": orphan_security_daily_sample,
-        "orphan_date_daily": orphan_date_daily_sample,
-        "orphan_date_snapshot": orphan_date_snapshot_sample,
-        "dup_daily": dup_daily_sample,
-        "dup_snapshot": dup_snapshot_sample,
-    }}
+    logging.info("[PYTEST] DQ payload (counts): %s", json.dumps(payload["counts"], indent=2))
+    return payload
 
 
 @task
@@ -523,15 +528,48 @@ def pytest_null_fks(sample_n: int = 10):
       LIMIT {sample_n}
     """)
 
-    logging.info(f"[PYTEST] Null FK daily cnt={null_fk_daily_cnt}; sample={null_fk_daily_sample}")
-    logging.info(f"[PYTEST] Null FK snap  cnt={null_fk_snap_cnt}; sample={null_fk_snap_sample}")
+    summary = {
+        "null_fk_daily_cnt": int(null_fk_daily_cnt),
+        "null_fk_snap_cnt": int(null_fk_snap_cnt),
+    }
+
+    logging.info(f"[PYTEST] Null FK counts: {summary}")
+    logging.info(f"[PYTEST] Null FK daily sample: {null_fk_daily_sample}")
+    logging.info(f"[PYTEST] Null FK snap  sample: {null_fk_snap_sample}")
 
     return {
-        "null_fk_daily_cnt": null_fk_daily_cnt,
-        "null_fk_daily_sample": null_fk_daily_sample,
-        "null_fk_snap_cnt": null_fk_snap_cnt,
-        "null_fk_snap_sample": null_fk_snap_sample,
+        "has_issues": any(v > 0 for v in summary.values()),
+        "counts": summary,
+        "samples": {
+            "null_fk_daily": null_fk_daily_sample,
+            "null_fk_snap": null_fk_snap_sample,
+        },
     }
+
+
+def dq_branch_callable(ti, **_):
+    """
+    Branch based on XCom from pytest_orphans_and_dups and pytest_null_fks.
+    If any has_issues=True, go to 'dq_has_issues', else 'dq_clean'.
+    """
+    dq1 = ti.xcom_pull(task_ids="pytest_orphans_and_dups") or {}
+    dq2 = ti.xcom_pull(task_ids="pytest_null_fks") or {}
+
+    has_issues = bool(dq1.get("has_issues")) or bool(dq2.get("has_issues"))
+
+    logging.info("[BRANCH] dq1.has_issues=%s, dq2.has_issues=%s => has_issues=%s",
+                 dq1.get("has_issues"), dq2.get("has_issues"), has_issues)
+
+    return "dq_has_issues" if has_issues else "dq_clean"
+
+
+@task
+def log_branch_report():
+    """
+    Just logs the XCom payloads again on the chosen branch.
+    """
+    logging.info("[BRANCH] Follow-up branch task executed.")
+    return "ok"
 
 
 default_args = {
@@ -581,17 +619,33 @@ with DAG(
         sql=SQL_MERGE_FACT_SECURITY_SNAPSHOT,
     )
 
-    # Keep SQL validate (may fail). If you want DAG to NEVER fail, comment this task + chain.
+    # Keep SQL validate (may fail). If you want branching to always run, comment validate and connect to snapshot directly.
     validate = SnowflakeOperator(
         task_id="validate",
         snowflake_conn_id=SNOWFLAKE_CONN_ID,
         sql=SQL_VALIDATE,
     )
 
-    # Python tests (NEVER fail; only log)
+    # Python tests (XCom outputs)
     t_py_row_counts = pytest_row_counts()
     t_py_orphans_dups = pytest_orphans_and_dups(sample_n=10)
     t_py_null_fks = pytest_null_fks(sample_n=10)
 
+    # Branching (reads XCom)
+    dq_branch = BranchPythonOperator(
+        task_id="dq_branch",
+        python_callable=dq_branch_callable,
+    )
+    dq_has_issues = EmptyOperator(task_id="dq_has_issues")
+    dq_clean = EmptyOperator(task_id="dq_clean")
+
+    # Optional follow-up logging tasks for each branch
+    followup_has_issues = log_branch_report.override(task_id="followup_has_issues")()
+    followup_clean = log_branch_report.override(task_id="followup_clean")()
+
+    # --- Dependencies ---
     create_tables >> load_dim_date >> upsert_dim_security >> merge_fact_stock_daily >> merge_fact_security_snapshot >> validate
-    validate >> t_py_row_counts >> t_py_orphans_dups >> t_py_null_fks
+    validate >> t_py_row_counts >> t_py_orphans_dups >> t_py_null_fks >> dq_branch
+
+    dq_branch >> dq_has_issues >> followup_has_issues
+    dq_branch >> dq_clean >> followup_clean

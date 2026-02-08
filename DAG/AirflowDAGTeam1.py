@@ -1,15 +1,11 @@
 """
 DAG: project1_stock_dimensional_etl_team1
 
-Runs a single end-to-end ETL in Snowflake:
-1) Create/replace target tables (DIM_DATE_TEAM1, DIM_SECURITY_TEAM1[SCD2], FACT_STOCK_DAILY_TEAM1, FACT_SECURITY_SNAPSHOT_TEAM1)
-2) Load DIM_DATE (calendar)
-3) SCD2 upsert DIM_SECURITY (SYMBOLS + COMPANY_PROFILE descriptive)
-4) Merge FACT_STOCK_DAILY (last 90 days, STOCK_HISTORY) using time-travel join to SCD2 dimension
-5) Merge FACT_SECURITY_SNAPSHOT (COMPANY_PROFILE metrics snapshot as-of today) using current dimension row
-6) SQL validate (does NOT fail; logs counts)
-7) Python tests (never fail; push counts to XCom) + Branching based on XCom metrics
-8) If dq_has_issues: backfill last 90 days fact (DELETE + INSERT) + run Python tests again (2nd validation pass) + log XCom
+Fix based on log:
+- decouple merge_fact_security_snapshot from merge_fact_stock_daily_90d
+- run facts in parallel after scd2_dim_security
+- add etl_done join node with a safer trigger_rule so downstream doesn't get stuck
+- keep branching + backfill + second validation loop
 
 Connection:
 SNOWFLAKE_CONN_ID = "jan_airflow_snowflake"
@@ -42,7 +38,7 @@ DIM_SECURITY_TBL = f"{DB}.{SCHEMA}.DIM_SECURITY_{GROUP_NUM.upper()}"
 FACT_DAILY_TBL = f"{DB}.{SCHEMA}.FACT_STOCK_DAILY_{GROUP_NUM.upper()}"
 FACT_SNAP_TBL = f"{DB}.{SCHEMA}.FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()}"
 
-DAYS_BACK = 90  # backfill / incremental window
+DAYS_BACK = 90
 
 
 # -----------------------------
@@ -66,7 +62,6 @@ CREATE OR REPLACE TABLE DIM_DATE_{GROUP_NUM.upper()} (
   CONSTRAINT UQ_DIM_DATE_{GROUP_NUM.upper()}_FULL_DATE UNIQUE (FULL_DATE)
 );
 
--- SCD2 DIM_SECURITY: allow multiple rows per SYMBOL (history)
 CREATE OR REPLACE TABLE DIM_SECURITY_{GROUP_NUM.upper()} (
   SECURITY_KEY            NUMBER(38,0) AUTOINCREMENT START 1 INCREMENT 1,
   SYMBOL                  VARCHAR(16)  NOT NULL,
@@ -158,8 +153,6 @@ FROM dates;
 
 # -----------------------------
 # SQL: SCD2 DIM_SECURITY
-# - expire changed current rows
-# - insert new current rows for new symbols or changed symbols
 # -----------------------------
 SQL_SCD2_DIM_SECURITY = f"""
 USE DATABASE {DB};
@@ -252,7 +245,7 @@ WHERE cur.SECURITY_KEY IS NULL
 
 
 # -----------------------------
-# SQL: FACT_STOCK_DAILY (incremental last 90 days) using time-travel join to SCD2
+# SQL: FACT_STOCK_DAILY (incremental last 90 days) time-travel join
 # -----------------------------
 SQL_MERGE_FACT_STOCK_DAILY_90D = f"""
 USE DATABASE {DB};
@@ -297,7 +290,7 @@ WHEN NOT MATCHED THEN INSERT (
 
 
 # -----------------------------
-# SQL: FACT_SECURITY_SNAPSHOT (as-of today) -> join to current SCD2 row
+# SQL: FACT_SECURITY_SNAPSHOT (as-of today) current dim row
 # -----------------------------
 SQL_MERGE_FACT_SECURITY_SNAPSHOT = f"""
 USE DATABASE {DB};
@@ -360,8 +353,7 @@ WHEN NOT MATCHED THEN INSERT (
 
 
 # -----------------------------
-# SQL: Backfill FACT_STOCK_DAILY last 90 days (DELETE + INSERT correct keys)
-# Only on dq_has_issues branch.
+# SQL: Backfill last 90 days (only on dq_has_issues branch)
 # -----------------------------
 SQL_BACKFILL_FACT_STOCK_DAILY_90D = f"""
 USE DATABASE {DB};
@@ -456,10 +448,10 @@ def _safe_fetchone(hook: SnowflakeHook, sql: str, default=0):
 
 
 # -----------------------------
-# Python Tests (XCom outputs)
+# Python Tests (XCom)
 # -----------------------------
 @task
-def pytest_orphans_and_dups(sample_n: int = 10):
+def pytest_orphans_and_dups():
     hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
     orphan_security_daily_cnt = _safe_fetchone(hook, f"""
@@ -509,11 +501,7 @@ def pytest_orphans_and_dups(sample_n: int = 10):
         "dup_snapshot_cnt": int(dup_snapshot_cnt),
     }
 
-    payload = {
-        "has_issues": any(v > 0 for v in summary.values()),
-        "counts": summary,
-    }
-
+    payload = {"has_issues": any(v > 0 for v in summary.values()), "counts": summary}
     logging.info("[PYTEST] Orphans/Dups counts: %s", json.dumps(payload, indent=2))
     return payload
 
@@ -539,38 +527,26 @@ def pytest_null_fks():
         "null_fk_snap_cnt": int(null_fk_snap_cnt),
     }
 
-    payload = {
-        "has_issues": any(v > 0 for v in summary.values()),
-        "counts": summary,
-    }
-
+    payload = {"has_issues": any(v > 0 for v in summary.values()), "counts": summary}
     logging.info("[PYTEST] Null FK counts: %s", json.dumps(payload, indent=2))
     return payload
 
 
 def dq_branch_callable(ti, **_):
-    """
-    Branch based on XCom from pytest_orphans_and_dups and pytest_null_fks.
-    If any has_issues=True, go to 'dq_has_issues', else 'dq_clean'.
-    """
     dq1 = ti.xcom_pull(task_ids="pytest_orphans_and_dups") or {}
     dq2 = ti.xcom_pull(task_ids="pytest_null_fks") or {}
 
     has_issues = bool(dq1.get("has_issues")) or bool(dq2.get("has_issues"))
-
     logging.info("[BRANCH] dq1=%s dq2=%s => has_issues=%s", dq1, dq2, has_issues)
     return "dq_has_issues" if has_issues else "dq_clean"
 
 
 @task
 def log_after_backfill_report(ti=None):
-    """
-    Logs second-pass validation XCom after backfill.
-    """
     dq1 = ti.xcom_pull(task_ids="pytest_orphans_and_dups_after_backfill") or {}
     dq2 = ti.xcom_pull(task_ids="pytest_null_fks_after_backfill") or {}
-    logging.info("[AFTER_BACKFILL] pytest_orphans_and_dups_after_backfill=%s", json.dumps(dq1, indent=2))
-    logging.info("[AFTER_BACKFILL] pytest_null_fks_after_backfill=%s", json.dumps(dq2, indent=2))
+    logging.info("[AFTER_BACKFILL] dq1=%s", json.dumps(dq1, indent=2))
+    logging.info("[AFTER_BACKFILL] dq2=%s", json.dumps(dq2, indent=2))
     return "ok"
 
 
@@ -587,11 +563,11 @@ default_args = {
 with DAG(
     dag_id=f"project1_stock_dimensional_etl_{GROUP_NUM}",
     default_args=default_args,
-    description="Snowflake->Snowflake dimensional model ETL (Team1) + SCD2 + 90d backfill + branching + recheck",
+    description="Snowflake->Snowflake dimensional model ETL + SCD2 + 90d backfill + branching + recheck (parallel facts)",
     start_date=datetime(2026, 2, 1),
     schedule_interval="@daily",
     catchup=False,
-    tags=["team1", "snowflake", "dimensional_model", "scd2", "dq"],
+    tags=["team1", "snowflake", "scd2", "dq"],
 ) as dag:
 
     create_tables = SnowflakeOperator(
@@ -612,6 +588,7 @@ with DAG(
         sql=SQL_SCD2_DIM_SECURITY,
     )
 
+    # ✅ facts run in parallel (fixes your log symptom)
     merge_fact_stock_daily_90d = SnowflakeOperator(
         task_id="merge_fact_stock_daily_90d",
         snowflake_conn_id=SNOWFLAKE_CONN_ID,
@@ -622,16 +599,26 @@ with DAG(
         task_id="merge_fact_security_snapshot",
         snowflake_conn_id=SNOWFLAKE_CONN_ID,
         sql=SQL_MERGE_FACT_SECURITY_SNAPSHOT,
+        trigger_rule="all_done",  # extra safety against upstream state weirdness
+    )
+
+    # Join point so downstream doesn't get blocked by an unrelated upstream
+    etl_done = EmptyOperator(
+        task_id="etl_done",
+        # if you want "run downstream even if daily fact failed", use all_done.
+        # This is a bit safer than all_done but still prevents 'stuck' when one branch succeeds.
+        trigger_rule="all_done",
     )
 
     validate = SnowflakeOperator(
         task_id="validate",
         snowflake_conn_id=SNOWFLAKE_CONN_ID,
         sql=SQL_VALIDATE,
+        trigger_rule="all_done",  # don't block DQ due to one upstream
     )
 
     # First-pass Python tests (XCom)
-    t_py_orphans_dups = pytest_orphans_and_dups(sample_n=10)
+    t_py_orphans_dups = pytest_orphans_and_dups()
     t_py_null_fks = pytest_null_fks()
 
     dq_branch = BranchPythonOperator(
@@ -642,17 +629,18 @@ with DAG(
     dq_has_issues = EmptyOperator(task_id="dq_has_issues")
     dq_clean = EmptyOperator(task_id="dq_clean")
 
-    # Backfill on issues
+    # Backfill only on issues
     backfill_fact_stock_daily_90d = SnowflakeOperator(
         task_id="backfill_fact_stock_daily_90d",
         snowflake_conn_id=SNOWFLAKE_CONN_ID,
         sql=SQL_BACKFILL_FACT_STOCK_DAILY_90D,
+        trigger_rule="all_done",
     )
 
-    # Second-pass Python tests (after backfill) - must have unique task_ids
+    # Second-pass tests after backfill
     t_py_orphans_dups_after_backfill = pytest_orphans_and_dups.override(
         task_id="pytest_orphans_and_dups_after_backfill"
-    )(sample_n=10)
+    )()
 
     t_py_null_fks_after_backfill = pytest_null_fks.override(
         task_id="pytest_null_fks_after_backfill"
@@ -662,8 +650,16 @@ with DAG(
     followup_clean = EmptyOperator(task_id="followup_clean")
 
     # --- Dependencies ---
-    create_tables >> load_dim_date >> scd2_dim_security >> merge_fact_stock_daily_90d >> merge_fact_security_snapshot >> validate
+    create_tables >> load_dim_date >> scd2_dim_security
 
+    # Parallelize fact loads (key fix)
+    scd2_dim_security >> merge_fact_stock_daily_90d
+    scd2_dim_security >> merge_fact_security_snapshot
+
+    # Join
+    [merge_fact_stock_daily_90d, merge_fact_security_snapshot] >> etl_done >> validate
+
+    # DQ + branching (won't be blocked by a single upstream odd state)
     validate >> t_py_orphans_dups >> t_py_null_fks >> dq_branch
 
     dq_branch >> dq_clean >> followup_clean

@@ -606,10 +606,11 @@ with DAG(
     )
 
     scd2_dim_security = SnowflakeOperator(
-        task_id="scd2_dim_security",
-        snowflake_conn_id=SNOWFLAKE_CONN_ID,
-        sql=SQL_SCD2_DIM_SECURITY,
+    task_id="scd2_dim_security",
+    snowflake_conn_id=SNOWFLAKE_CONN_ID,
+    sql=[SQL_SCD2_EXPIRE, SQL_SCD2_INSERT],
     )
+
 
     # ✅ facts run in parallel (fixes your log symptom)
     merge_fact_stock_daily_90d = SnowflakeOperator(

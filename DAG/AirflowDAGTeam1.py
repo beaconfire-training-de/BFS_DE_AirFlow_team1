@@ -158,18 +158,16 @@ SQL_SCD2_DIM_SECURITY = f"""
 USE DATABASE {DB};
 USE SCHEMA {SCHEMA};
 
-WITH src AS (
+-- 0) Build src in a temp CTE (re-used by both DMLs via inline subquery)
+-- 1) EXPIRE changed current rows
+UPDATE DIM_SECURITY_{GROUP_NUM.upper()} tgt
+SET
+  EFFECTIVE_END_DATE = DATEADD(DAY, -1, CURRENT_DATE()),
+  IS_CURRENT = FALSE,
+  LOAD_TS = CURRENT_TIMESTAMP()
+FROM (
   SELECT
     s.SYMBOL                                  AS SYMBOL,
-    s.NAME                                    AS SYMBOL_NAME,
-    COALESCE(cp.EXCHANGE, s.EXCHANGE)         AS EXCHANGE,
-    cp.ID                                     AS SOURCE_COMPANY_ID,
-    cp.COMPANYNAME                            AS COMPANY_NAME,
-    cp.SECTOR                                 AS SECTOR,
-    cp.INDUSTRY                               AS INDUSTRY,
-    cp.CEO                                    AS CEO,
-    cp.WEBSITE                                AS WEBSITE,
-    cp.DESCRIPTION                            AS DESCRIPTION,
     HASH(
       COALESCE(s.NAME,''),
       COALESCE(COALESCE(cp.EXCHANGE, s.EXCHANGE),''),
@@ -189,21 +187,13 @@ WITH src AS (
     QUALIFY ROW_NUMBER() OVER (PARTITION BY SYMBOL ORDER BY ID DESC) = 1
   ) cp
     ON cp.SYMBOL = s.SYMBOL
-),
+) src
+WHERE tgt.SYMBOL = src.SYMBOL
+  AND tgt.IS_CURRENT = TRUE
+  AND tgt.ROW_HASH <> src.ROW_HASH
+;
 
-expired AS (
-  UPDATE DIM_SECURITY_{GROUP_NUM.upper()} tgt
-  SET
-    EFFECTIVE_END_DATE = CURRENT_DATE() - 1,
-    IS_CURRENT = FALSE,
-    LOAD_TS = CURRENT_TIMESTAMP()
-  FROM src
-  WHERE tgt.SYMBOL = src.SYMBOL
-    AND tgt.IS_CURRENT = TRUE
-    AND tgt.ROW_HASH <> src.ROW_HASH
-  RETURNING src.SYMBOL
-)
-
+-- 2) INSERT new current rows (new symbols OR changed symbols)
 INSERT INTO DIM_SECURITY_{GROUP_NUM.upper()} (
   SYMBOL,
   SYMBOL_NAME,
@@ -235,13 +225,46 @@ SELECT
   CURRENT_DATE(),
   NULL,
   TRUE
-FROM src
+FROM (
+  SELECT
+    s.SYMBOL                                  AS SYMBOL,
+    s.NAME                                    AS SYMBOL_NAME,
+    COALESCE(cp.EXCHANGE, s.EXCHANGE)         AS EXCHANGE,
+    cp.ID                                     AS SOURCE_COMPANY_ID,
+    cp.COMPANYNAME                            AS COMPANY_NAME,
+    cp.SECTOR                                 AS SECTOR,
+    cp.INDUSTRY                               AS INDUSTRY,
+    cp.CEO                                    AS CEO,
+    cp.WEBSITE                                AS WEBSITE,
+    cp.DESCRIPTION                            AS DESCRIPTION,
+    HASH(
+      COALESCE(s.NAME,''),
+      COALESCE(COALESCE(cp.EXCHANGE, s.EXCHANGE),''),
+      COALESCE(cp.ID::VARCHAR,''),
+      COALESCE(cp.COMPANYNAME,''),
+      COALESCE(cp.SECTOR,''),
+      COALESCE(cp.INDUSTRY,''),
+      COALESCE(cp.CEO,''),
+      COALESCE(cp.WEBSITE,''),
+      COALESCE(cp.DESCRIPTION,'')
+    )::VARCHAR AS ROW_HASH
+  FROM US_STOCK_DAILY.DCCM.SYMBOLS s
+  LEFT JOIN (
+    SELECT
+      ID, SYMBOL, COMPANYNAME, EXCHANGE, INDUSTRY, WEBSITE, DESCRIPTION, CEO, SECTOR
+    FROM US_STOCK_DAILY.DCCM.COMPANY_PROFILE
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY SYMBOL ORDER BY ID DESC) = 1
+  ) cp
+    ON cp.SYMBOL = s.SYMBOL
+) src
 LEFT JOIN DIM_SECURITY_{GROUP_NUM.upper()} cur
   ON cur.SYMBOL = src.SYMBOL
  AND cur.IS_CURRENT = TRUE
 WHERE cur.SECURITY_KEY IS NULL
-   OR cur.ROW_HASH <> src.ROW_HASH;
+   OR cur.ROW_HASH <> src.ROW_HASH
+;
 """
+
 
 
 # -----------------------------

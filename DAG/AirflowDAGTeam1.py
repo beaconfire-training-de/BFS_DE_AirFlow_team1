@@ -2,12 +2,14 @@
 DAG: project1_stock_dimensional_etl_team1
 
 Runs a single end-to-end ETL in Snowflake:
-1) Create/replace target tables (DIM_DATE_TEAM1, DIM_SECURITY_TEAM1, FACT_STOCK_DAILY_TEAM1, FACT_SECURITY_SNAPSHOT_TEAM1)
+1) Create/replace target tables (DIM_DATE_TEAM1, DIM_SECURITY_TEAM1[SCD2], FACT_STOCK_DAILY_TEAM1, FACT_SECURITY_SNAPSHOT_TEAM1)
 2) Load DIM_DATE (calendar)
-3) Upsert DIM_SECURITY (SYMBOLS + COMPANY_PROFILE descriptive)
-4) Merge FACT_STOCK_DAILY (STOCK_HISTORY)
-5) Merge FACT_SECURITY_SNAPSHOT (COMPANY_PROFILE metrics snapshot as-of today)
-6) SQL validate (may fail) + Python tests (never fail, only log) + Branching based on XCom metrics
+3) SCD2 upsert DIM_SECURITY (SYMBOLS + COMPANY_PROFILE descriptive)
+4) Merge FACT_STOCK_DAILY (last 90 days, STOCK_HISTORY) using time-travel join to SCD2 dimension
+5) Merge FACT_SECURITY_SNAPSHOT (COMPANY_PROFILE metrics snapshot as-of today) using current dimension row
+6) SQL validate (does NOT fail; logs counts)
+7) Python tests (never fail; push counts to XCom) + Branching based on XCom metrics
+8) If dq_has_issues: backfill last 90 days fact (DELETE + INSERT) + run Python tests again (2nd validation pass) + log XCom
 
 Connection:
 SNOWFLAKE_CONN_ID = "jan_airflow_snowflake"
@@ -26,6 +28,9 @@ from airflow.operators.python import BranchPythonOperator
 from airflow.operators.empty import EmptyOperator
 
 
+# -----------------------------
+# Config
+# -----------------------------
 GROUP_NUM = "team1"
 SNOWFLAKE_CONN_ID = "jan_airflow_snowflake"
 
@@ -37,12 +42,15 @@ DIM_SECURITY_TBL = f"{DB}.{SCHEMA}.DIM_SECURITY_{GROUP_NUM.upper()}"
 FACT_DAILY_TBL = f"{DB}.{SCHEMA}.FACT_STOCK_DAILY_{GROUP_NUM.upper()}"
 FACT_SNAP_TBL = f"{DB}.{SCHEMA}.FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()}"
 
+DAYS_BACK = 90  # backfill / incremental window
+
+
 # -----------------------------
-# SQL: DDL
+# SQL: DDL (DIM_SECURITY becomes SCD2)
 # -----------------------------
 SQL_CREATE_TABLES = f"""
-USE DATABASE AIRFLOW0105;
-USE SCHEMA DEV;
+USE DATABASE {DB};
+USE SCHEMA {SCHEMA};
 
 CREATE OR REPLACE TABLE DIM_DATE_{GROUP_NUM.upper()} (
   DATE_KEY       NUMBER(8,0)   NOT NULL,   -- YYYYMMDD
@@ -58,20 +66,29 @@ CREATE OR REPLACE TABLE DIM_DATE_{GROUP_NUM.upper()} (
   CONSTRAINT UQ_DIM_DATE_{GROUP_NUM.upper()}_FULL_DATE UNIQUE (FULL_DATE)
 );
 
+-- SCD2 DIM_SECURITY: allow multiple rows per SYMBOL (history)
 CREATE OR REPLACE TABLE DIM_SECURITY_{GROUP_NUM.upper()} (
-  SECURITY_KEY       NUMBER(38,0) AUTOINCREMENT START 1 INCREMENT 1,
-  SYMBOL             VARCHAR(16)  NOT NULL,
-  SYMBOL_NAME        VARCHAR(256),
-  EXCHANGE           VARCHAR(64),
-  SOURCE_COMPANY_ID  NUMBER(38,0),
-  COMPANY_NAME       VARCHAR(512),
-  SECTOR             VARCHAR(64),
-  INDUSTRY           VARCHAR(64),
-  CEO                VARCHAR(64),
-  WEBSITE            VARCHAR(256),
-  DESCRIPTION        VARCHAR(4096),
-  CONSTRAINT PK_DIM_SECURITY_{GROUP_NUM.upper()} PRIMARY KEY (SECURITY_KEY),
-  CONSTRAINT UQ_DIM_SECURITY_{GROUP_NUM.upper()}_SYMBOL UNIQUE (SYMBOL)
+  SECURITY_KEY            NUMBER(38,0) AUTOINCREMENT START 1 INCREMENT 1,
+  SYMBOL                  VARCHAR(16)  NOT NULL,
+
+  SYMBOL_NAME             VARCHAR(256),
+  EXCHANGE                VARCHAR(64),
+  SOURCE_COMPANY_ID       NUMBER(38,0),
+  COMPANY_NAME            VARCHAR(512),
+  SECTOR                  VARCHAR(64),
+  INDUSTRY                VARCHAR(64),
+  CEO                     VARCHAR(64),
+  WEBSITE                 VARCHAR(256),
+  DESCRIPTION             VARCHAR(4096),
+
+  ROW_HASH                VARCHAR(64)  NOT NULL,
+  EFFECTIVE_START_DATE    DATE         NOT NULL,
+  EFFECTIVE_END_DATE      DATE,
+  IS_CURRENT              BOOLEAN      NOT NULL,
+
+  LOAD_TS                 TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+
+  CONSTRAINT PK_DIM_SECURITY_{GROUP_NUM.upper()} PRIMARY KEY (SECURITY_KEY)
 );
 
 CREATE OR REPLACE TABLE FACT_STOCK_DAILY_{GROUP_NUM.upper()} (
@@ -112,12 +129,13 @@ CREATE OR REPLACE TABLE FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()} (
 );
 """
 
+
 # -----------------------------
-# SQL: Loads / Merges
+# SQL: Load DIM_DATE
 # -----------------------------
 SQL_LOAD_DIM_DATE = f"""
-USE DATABASE AIRFLOW0105;
-USE SCHEMA DEV;
+USE DATABASE {DB};
+USE SCHEMA {SCHEMA};
 
 INSERT OVERWRITE INTO DIM_DATE_{GROUP_NUM.upper()}
 WITH dates AS (
@@ -137,26 +155,17 @@ SELECT
 FROM dates;
 """
 
-SQL_MERGE_DIM_SECURITY = f"""
-USE DATABASE AIRFLOW0105;
-USE SCHEMA DEV;
 
-MERGE INTO DIM_SECURITY_{GROUP_NUM.upper()} tgt
-USING (
-  WITH cp AS (
-    SELECT
-      ID,
-      SYMBOL,
-      COMPANYNAME,
-      EXCHANGE,
-      INDUSTRY,
-      WEBSITE,
-      DESCRIPTION,
-      CEO,
-      SECTOR
-    FROM US_STOCK_DAILY.DCCM.COMPANY_PROFILE
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY SYMBOL ORDER BY ID DESC) = 1
-  )
+# -----------------------------
+# SQL: SCD2 DIM_SECURITY
+# - expire changed current rows
+# - insert new current rows for new symbols or changed symbols
+# -----------------------------
+SQL_SCD2_DIM_SECURITY = f"""
+USE DATABASE {DB};
+USE SCHEMA {SCHEMA};
+
+WITH src AS (
   SELECT
     s.SYMBOL                                  AS SYMBOL,
     s.NAME                                    AS SYMBOL_NAME,
@@ -167,49 +176,107 @@ USING (
     cp.INDUSTRY                               AS INDUSTRY,
     cp.CEO                                    AS CEO,
     cp.WEBSITE                                AS WEBSITE,
-    cp.DESCRIPTION                            AS DESCRIPTION
+    cp.DESCRIPTION                            AS DESCRIPTION,
+    HASH(
+      COALESCE(s.NAME,''),
+      COALESCE(COALESCE(cp.EXCHANGE, s.EXCHANGE),''),
+      COALESCE(cp.ID::VARCHAR,''),
+      COALESCE(cp.COMPANYNAME,''),
+      COALESCE(cp.SECTOR,''),
+      COALESCE(cp.INDUSTRY,''),
+      COALESCE(cp.CEO,''),
+      COALESCE(cp.WEBSITE,''),
+      COALESCE(cp.DESCRIPTION,'')
+    )::VARCHAR AS ROW_HASH
   FROM US_STOCK_DAILY.DCCM.SYMBOLS s
-  LEFT JOIN cp
+  LEFT JOIN (
+    SELECT
+      ID, SYMBOL, COMPANYNAME, EXCHANGE, INDUSTRY, WEBSITE, DESCRIPTION, CEO, SECTOR
+    FROM US_STOCK_DAILY.DCCM.COMPANY_PROFILE
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY SYMBOL ORDER BY ID DESC) = 1
+  ) cp
     ON cp.SYMBOL = s.SYMBOL
-) src
-ON tgt.SYMBOL = src.SYMBOL
-WHEN MATCHED THEN UPDATE SET
-  tgt.SYMBOL_NAME       = src.SYMBOL_NAME,
-  tgt.EXCHANGE          = src.EXCHANGE,
-  tgt.SOURCE_COMPANY_ID = src.SOURCE_COMPANY_ID,
-  tgt.COMPANY_NAME      = src.COMPANY_NAME,
-  tgt.SECTOR            = src.SECTOR,
-  tgt.INDUSTRY          = src.INDUSTRY,
-  tgt.CEO               = src.CEO,
-  tgt.WEBSITE           = src.WEBSITE,
-  tgt.DESCRIPTION       = src.DESCRIPTION
-WHEN NOT MATCHED THEN INSERT (
-  SYMBOL, SYMBOL_NAME, EXCHANGE, SOURCE_COMPANY_ID, COMPANY_NAME, SECTOR, INDUSTRY, CEO, WEBSITE, DESCRIPTION
-) VALUES (
-  src.SYMBOL, src.SYMBOL_NAME, src.EXCHANGE, src.SOURCE_COMPANY_ID, src.COMPANY_NAME, src.SECTOR, src.INDUSTRY, src.CEO, src.WEBSITE, src.DESCRIPTION
-);
+),
+
+expired AS (
+  UPDATE DIM_SECURITY_{GROUP_NUM.upper()} tgt
+  SET
+    EFFECTIVE_END_DATE = CURRENT_DATE() - 1,
+    IS_CURRENT = FALSE,
+    LOAD_TS = CURRENT_TIMESTAMP()
+  FROM src
+  WHERE tgt.SYMBOL = src.SYMBOL
+    AND tgt.IS_CURRENT = TRUE
+    AND tgt.ROW_HASH <> src.ROW_HASH
+  RETURNING src.SYMBOL
+)
+
+INSERT INTO DIM_SECURITY_{GROUP_NUM.upper()} (
+  SYMBOL,
+  SYMBOL_NAME,
+  EXCHANGE,
+  SOURCE_COMPANY_ID,
+  COMPANY_NAME,
+  SECTOR,
+  INDUSTRY,
+  CEO,
+  WEBSITE,
+  DESCRIPTION,
+  ROW_HASH,
+  EFFECTIVE_START_DATE,
+  EFFECTIVE_END_DATE,
+  IS_CURRENT
+)
+SELECT
+  src.SYMBOL,
+  src.SYMBOL_NAME,
+  src.EXCHANGE,
+  src.SOURCE_COMPANY_ID,
+  src.COMPANY_NAME,
+  src.SECTOR,
+  src.INDUSTRY,
+  src.CEO,
+  src.WEBSITE,
+  src.DESCRIPTION,
+  src.ROW_HASH,
+  CURRENT_DATE(),
+  NULL,
+  TRUE
+FROM src
+LEFT JOIN DIM_SECURITY_{GROUP_NUM.upper()} cur
+  ON cur.SYMBOL = src.SYMBOL
+ AND cur.IS_CURRENT = TRUE
+WHERE cur.SECURITY_KEY IS NULL
+   OR cur.ROW_HASH <> src.ROW_HASH;
 """
 
-SQL_MERGE_FACT_STOCK_DAILY = f"""
-USE DATABASE AIRFLOW0105;
-USE SCHEMA DEV;
+
+# -----------------------------
+# SQL: FACT_STOCK_DAILY (incremental last 90 days) using time-travel join to SCD2
+# -----------------------------
+SQL_MERGE_FACT_STOCK_DAILY_90D = f"""
+USE DATABASE {DB};
+USE SCHEMA {SCHEMA};
 
 MERGE INTO FACT_STOCK_DAILY_{GROUP_NUM.upper()} tgt
 USING (
   SELECT
-    ds.SECURITY_KEY                                           AS SECURITY_KEY,
-    dd.DATE_KEY                                               AS DATE_KEY,
-    sh.OPEN                                                   AS OPEN,
-    sh.HIGH                                                   AS HIGH,
-    sh.LOW                                                    AS LOW,
-    sh.CLOSE                                                  AS CLOSE,
-    sh.ADJCLOSE                                               AS ADJCLOSE,
-    sh.VOLUME                                                 AS VOLUME
+    ds.SECURITY_KEY AS SECURITY_KEY,
+    dd.DATE_KEY     AS DATE_KEY,
+    sh.OPEN         AS OPEN,
+    sh.HIGH         AS HIGH,
+    sh.LOW          AS LOW,
+    sh.CLOSE        AS CLOSE,
+    sh.ADJCLOSE     AS ADJCLOSE,
+    sh.VOLUME       AS VOLUME
   FROM US_STOCK_DAILY.DCCM.STOCK_HISTORY sh
+  JOIN DIM_DATE_{GROUP_NUM.upper()} dd
+    ON dd.FULL_DATE = sh.DATE
   JOIN DIM_SECURITY_{GROUP_NUM.upper()} ds
     ON ds.SYMBOL = sh.SYMBOL
-  JOIN DIM_DATE_{GROUP_NUM.upper()} dd
-    on dd.FULL_DATE = sh.DATE
+   AND sh.DATE >= ds.EFFECTIVE_START_DATE
+   AND sh.DATE <= COALESCE(ds.EFFECTIVE_END_DATE, '9999-12-31'::DATE)
+  WHERE sh.DATE >= DATEADD(DAY, -{DAYS_BACK}, CURRENT_DATE())
 ) src
 ON tgt.SECURITY_KEY = src.SECURITY_KEY
 AND tgt.DATE_KEY     = src.DATE_KEY
@@ -228,9 +295,13 @@ WHEN NOT MATCHED THEN INSERT (
 );
 """
 
+
+# -----------------------------
+# SQL: FACT_SECURITY_SNAPSHOT (as-of today) -> join to current SCD2 row
+# -----------------------------
 SQL_MERGE_FACT_SECURITY_SNAPSHOT = f"""
-USE DATABASE AIRFLOW0105;
-USE SCHEMA DEV;
+USE DATABASE {DB};
+USE SCHEMA {SCHEMA};
 
 MERGE INTO FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()} tgt
 USING (
@@ -265,6 +336,7 @@ USING (
   FROM cp
   JOIN DIM_SECURITY_{GROUP_NUM.upper()} ds
     ON ds.SYMBOL = cp.SYMBOL
+   AND ds.IS_CURRENT = TRUE
 ) src
 ON tgt.SECURITY_KEY   = src.SECURITY_KEY
 AND tgt.ASOF_DATE_KEY = src.ASOF_DATE_KEY
@@ -286,84 +358,87 @@ WHEN NOT MATCHED THEN INSERT (
 );
 """
 
+
 # -----------------------------
-# SQL: Validations (can fail DAG)
+# SQL: Backfill FACT_STOCK_DAILY last 90 days (DELETE + INSERT correct keys)
+# Only on dq_has_issues branch.
+# -----------------------------
+SQL_BACKFILL_FACT_STOCK_DAILY_90D = f"""
+USE DATABASE {DB};
+USE SCHEMA {SCHEMA};
+
+DELETE FROM FACT_STOCK_DAILY_{GROUP_NUM.upper()}
+WHERE DATE_KEY IN (
+  SELECT DATE_KEY
+  FROM DIM_DATE_{GROUP_NUM.upper()}
+  WHERE FULL_DATE >= DATEADD(DAY, -{DAYS_BACK}, CURRENT_DATE())
+);
+
+INSERT INTO FACT_STOCK_DAILY_{GROUP_NUM.upper()} (
+  SECURITY_KEY, DATE_KEY, OPEN, HIGH, LOW, CLOSE, ADJCLOSE, VOLUME
+)
+SELECT
+  ds.SECURITY_KEY,
+  dd.DATE_KEY,
+  sh.OPEN, sh.HIGH, sh.LOW, sh.CLOSE, sh.ADJCLOSE, sh.VOLUME
+FROM US_STOCK_DAILY.DCCM.STOCK_HISTORY sh
+JOIN DIM_DATE_{GROUP_NUM.upper()} dd
+  ON dd.FULL_DATE = sh.DATE
+JOIN DIM_SECURITY_{GROUP_NUM.upper()} ds
+  ON ds.SYMBOL = sh.SYMBOL
+ AND sh.DATE >= ds.EFFECTIVE_START_DATE
+ AND sh.DATE <= COALESCE(ds.EFFECTIVE_END_DATE, '9999-12-31'::DATE)
+WHERE sh.DATE >= DATEADD(DAY, -{DAYS_BACK}, CURRENT_DATE());
+"""
+
+
+# -----------------------------
+# SQL: Validate (does NOT fail; prints counts)
 # -----------------------------
 SQL_VALIDATE = f"""
-USE DATABASE AIRFLOW0105;
-USE SCHEMA DEV;
+USE DATABASE {DB};
+USE SCHEMA {SCHEMA};
 
 WITH checks AS (
   SELECT
-    (SELECT COUNT(*) FROM FACT_STOCK_DAILY_TEAM1 f
-      LEFT JOIN DIM_SECURITY_TEAM1 d ON f.SECURITY_KEY=d.SECURITY_KEY
+    (SELECT COUNT(*) FROM FACT_STOCK_DAILY_{GROUP_NUM.upper()} f
+      LEFT JOIN DIM_SECURITY_{GROUP_NUM.upper()} d ON f.SECURITY_KEY=d.SECURITY_KEY
       WHERE d.SECURITY_KEY IS NULL) AS orphan_security_daily_cnt,
 
-    (SELECT COUNT(*) FROM FACT_STOCK_DAILY_TEAM1 f
-      LEFT JOIN DIM_DATE_TEAM1 d ON f.DATE_KEY=d.DATE_KEY
+    (SELECT COUNT(*) FROM FACT_STOCK_DAILY_{GROUP_NUM.upper()} f
+      LEFT JOIN DIM_DATE_{GROUP_NUM.upper()} d ON f.DATE_KEY=d.DATE_KEY
       WHERE d.DATE_KEY IS NULL) AS orphan_date_daily_cnt,
 
-    (SELECT COUNT(*) FROM FACT_SECURITY_SNAPSHOT_TEAM1 s
-      LEFT JOIN DIM_DATE_TEAM1 d ON s.ASOF_DATE_KEY=d.DATE_KEY
+    (SELECT COUNT(*) FROM FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()} s
+      LEFT JOIN DIM_DATE_{GROUP_NUM.upper()} d ON s.ASOF_DATE_KEY=d.DATE_KEY
       WHERE d.DATE_KEY IS NULL) AS orphan_date_snapshot_cnt,
 
     (SELECT COUNT(*) FROM (
       SELECT SECURITY_KEY, DATE_KEY
-      FROM FACT_STOCK_DAILY_TEAM1
+      FROM FACT_STOCK_DAILY_{GROUP_NUM.upper()}
       GROUP BY 1,2
       HAVING COUNT(*) > 1
     )) AS dup_daily_cnt,
 
     (SELECT COUNT(*) FROM (
       SELECT SECURITY_KEY, ASOF_DATE_KEY
-      FROM FACT_SECURITY_SNAPSHOT_TEAM1
+      FROM FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()}
       GROUP BY 1,2
       HAVING COUNT(*) > 1
     )) AS dup_snapshot_cnt
 )
 SELECT * FROM checks;
 
-WITH checks AS (
-  SELECT
-    (SELECT COUNT(*) FROM FACT_STOCK_DAILY_TEAM1 f
-      LEFT JOIN DIM_SECURITY_TEAM1 d ON f.SECURITY_KEY=d.SECURITY_KEY
-      WHERE d.SECURITY_KEY IS NULL) AS orphan_security_daily_cnt,
-    (SELECT COUNT(*) FROM FACT_STOCK_DAILY_TEAM1 f
-      LEFT JOIN DIM_DATE_TEAM1 d ON f.DATE_KEY=d.DATE_KEY
-      WHERE d.DATE_KEY IS NULL) AS orphan_date_daily_cnt,
-    (SELECT COUNT(*) FROM FACT_SECURITY_SNAPSHOT_TEAM1 s
-      LEFT JOIN DIM_DATE_TEAM1 d ON s.ASOF_DATE_KEY=d.DATE_KEY
-      WHERE d.DATE_KEY IS NULL) AS orphan_date_snapshot_cnt,
-    (SELECT COUNT(*) FROM (
-      SELECT SECURITY_KEY, DATE_KEY
-      FROM FACT_STOCK_DAILY_TEAM1
-      GROUP BY 1,2
-      HAVING COUNT(*) > 1
-    )) AS dup_daily_cnt,
-    (SELECT COUNT(*) FROM (
-      SELECT SECURITY_KEY, ASOF_DATE_KEY
-      FROM FACT_SECURITY_SNAPSHOT_TEAM1
-      GROUP BY 1,2
-      HAVING COUNT(*) > 1
-    )) AS dup_snapshot_cnt
-)
 SELECT
-  CASE
-    WHEN (orphan_security_daily_cnt + orphan_date_daily_cnt + orphan_date_snapshot_cnt + dup_daily_cnt + dup_snapshot_cnt) = 0
-    THEN 1
-    ELSE TO_NUMBER('0')  -- throw error to fail
-  END AS validation_status
-FROM checks;
-
-SELECT
-  (SELECT COUNT(*) FROM DIM_DATE_TEAM1)               AS dim_date_cnt,
-  (SELECT COUNT(*) FROM DIM_SECURITY_TEAM1)           AS dim_security_cnt,
-  (SELECT COUNT(*) FROM FACT_STOCK_DAILY_TEAM1)       AS fact_stock_daily_cnt,
-  (SELECT COUNT(*) FROM FACT_SECURITY_SNAPSHOT_TEAM1) AS fact_security_snapshot_cnt;
+  (SELECT COUNT(*) FROM DIM_DATE_{GROUP_NUM.upper()})               AS dim_date_cnt,
+  (SELECT COUNT(*) FROM DIM_SECURITY_{GROUP_NUM.upper()})           AS dim_security_cnt,
+  (SELECT COUNT(*) FROM FACT_STOCK_DAILY_{GROUP_NUM.upper()})       AS fact_stock_daily_cnt,
+  (SELECT COUNT(*) FROM FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()}) AS fact_security_snapshot_cnt;
 """
 
+
 # -----------------------------
-# Python Tests (never fail DAG; only log)
+# Python helper: safe query (never fail task)
 # -----------------------------
 def _safe_fetchall(hook: SnowflakeHook, sql: str):
     try:
@@ -380,21 +455,9 @@ def _safe_fetchone(hook: SnowflakeHook, sql: str, default=0):
     return rows[0][0]
 
 
-@task
-def pytest_row_counts():
-    hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-    sql = f"""
-      SELECT
-        (SELECT COUNT(*) FROM {DIM_DATE_TBL})     AS dim_date_cnt,
-        (SELECT COUNT(*) FROM {DIM_SECURITY_TBL}) AS dim_security_cnt,
-        (SELECT COUNT(*) FROM {FACT_DAILY_TBL})   AS fact_daily_cnt,
-        (SELECT COUNT(*) FROM {FACT_SNAP_TBL})    AS fact_snap_cnt
-    """
-    rows = _safe_fetchall(hook, sql)
-    logging.info(f"[PYTEST] Row counts: {rows[0] if rows else 'N/A'}")
-    return {"row_counts": rows[0] if rows else None}
-
-
+# -----------------------------
+# Python Tests (XCom outputs)
+# -----------------------------
 @task
 def pytest_orphans_and_dups(sample_n: int = 10):
     hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
@@ -405,13 +468,6 @@ def pytest_orphans_and_dups(sample_n: int = 10):
       LEFT JOIN {DIM_SECURITY_TBL} d ON f.SECURITY_KEY = d.SECURITY_KEY
       WHERE d.SECURITY_KEY IS NULL
     """)
-    orphan_security_daily_sample = _safe_fetchall(hook, f"""
-      SELECT f.SECURITY_KEY, f.DATE_KEY
-      FROM {FACT_DAILY_TBL} f
-      LEFT JOIN {DIM_SECURITY_TBL} d ON f.SECURITY_KEY = d.SECURITY_KEY
-      WHERE d.SECURITY_KEY IS NULL
-      LIMIT {sample_n}
-    """)
 
     orphan_date_daily_cnt = _safe_fetchone(hook, f"""
       SELECT COUNT(*)
@@ -419,26 +475,12 @@ def pytest_orphans_and_dups(sample_n: int = 10):
       LEFT JOIN {DIM_DATE_TBL} d ON f.DATE_KEY = d.DATE_KEY
       WHERE d.DATE_KEY IS NULL
     """)
-    orphan_date_daily_sample = _safe_fetchall(hook, f"""
-      SELECT f.SECURITY_KEY, f.DATE_KEY
-      FROM {FACT_DAILY_TBL} f
-      LEFT JOIN {DIM_DATE_TBL} d ON f.DATE_KEY = d.DATE_KEY
-      WHERE d.DATE_KEY IS NULL
-      LIMIT {sample_n}
-    """)
 
     orphan_date_snapshot_cnt = _safe_fetchone(hook, f"""
       SELECT COUNT(*)
       FROM {FACT_SNAP_TBL} s
       LEFT JOIN {DIM_DATE_TBL} d ON s.ASOF_DATE_KEY = d.DATE_KEY
       WHERE d.DATE_KEY IS NULL
-    """)
-    orphan_date_snapshot_sample = _safe_fetchall(hook, f"""
-      SELECT s.SECURITY_KEY, s.ASOF_DATE_KEY
-      FROM {FACT_SNAP_TBL} s
-      LEFT JOIN {DIM_DATE_TBL} d ON s.ASOF_DATE_KEY = d.DATE_KEY
-      WHERE d.DATE_KEY IS NULL
-      LIMIT {sample_n}
     """)
 
     dup_daily_cnt = _safe_fetchone(hook, f"""
@@ -449,14 +491,6 @@ def pytest_orphans_and_dups(sample_n: int = 10):
         HAVING COUNT(*) > 1
       )
     """)
-    dup_daily_sample = _safe_fetchall(hook, f"""
-      SELECT SECURITY_KEY, DATE_KEY, COUNT(*) AS cnt
-      FROM {FACT_DAILY_TBL}
-      GROUP BY 1,2
-      HAVING COUNT(*) > 1
-      ORDER BY cnt DESC
-      LIMIT {sample_n}
-    """)
 
     dup_snapshot_cnt = _safe_fetchone(hook, f"""
       SELECT COUNT(*) FROM (
@@ -465,14 +499,6 @@ def pytest_orphans_and_dups(sample_n: int = 10):
         GROUP BY 1,2
         HAVING COUNT(*) > 1
       )
-    """)
-    dup_snapshot_sample = _safe_fetchall(hook, f"""
-      SELECT SECURITY_KEY, ASOF_DATE_KEY, COUNT(*) AS cnt
-      FROM {FACT_SNAP_TBL}
-      GROUP BY 1,2
-      HAVING COUNT(*) > 1
-      ORDER BY cnt DESC
-      LIMIT {sample_n}
     """)
 
     summary = {
@@ -483,25 +509,17 @@ def pytest_orphans_and_dups(sample_n: int = 10):
         "dup_snapshot_cnt": int(dup_snapshot_cnt),
     }
 
-    # This return value goes to XCom automatically.
     payload = {
         "has_issues": any(v > 0 for v in summary.values()),
         "counts": summary,
-        "samples": {
-            "orphan_security_daily": orphan_security_daily_sample,
-            "orphan_date_daily": orphan_date_daily_sample,
-            "orphan_date_snapshot": orphan_date_snapshot_sample,
-            "dup_daily": dup_daily_sample,
-            "dup_snapshot": dup_snapshot_sample,
-        },
     }
 
-    logging.info("[PYTEST] DQ payload (counts): %s", json.dumps(payload["counts"], indent=2))
+    logging.info("[PYTEST] Orphans/Dups counts: %s", json.dumps(payload, indent=2))
     return payload
 
 
 @task
-def pytest_null_fks(sample_n: int = 10):
+def pytest_null_fks():
     hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
 
     null_fk_daily_cnt = _safe_fetchone(hook, f"""
@@ -509,23 +527,11 @@ def pytest_null_fks(sample_n: int = 10):
       FROM {FACT_DAILY_TBL}
       WHERE SECURITY_KEY IS NULL OR DATE_KEY IS NULL
     """)
-    null_fk_daily_sample = _safe_fetchall(hook, f"""
-      SELECT SECURITY_KEY, DATE_KEY, OPEN, HIGH, LOW, CLOSE, ADJCLOSE, VOLUME
-      FROM {FACT_DAILY_TBL}
-      WHERE SECURITY_KEY IS NULL OR DATE_KEY IS NULL
-      LIMIT {sample_n}
-    """)
 
     null_fk_snap_cnt = _safe_fetchone(hook, f"""
       SELECT COUNT(*)
       FROM {FACT_SNAP_TBL}
       WHERE SECURITY_KEY IS NULL OR ASOF_DATE_KEY IS NULL
-    """)
-    null_fk_snap_sample = _safe_fetchall(hook, f"""
-      SELECT SECURITY_KEY, ASOF_DATE_KEY, PRICE, BETA, VOLAVG, MKTCAP
-      FROM {FACT_SNAP_TBL}
-      WHERE SECURITY_KEY IS NULL OR ASOF_DATE_KEY IS NULL
-      LIMIT {sample_n}
     """)
 
     summary = {
@@ -533,18 +539,13 @@ def pytest_null_fks(sample_n: int = 10):
         "null_fk_snap_cnt": int(null_fk_snap_cnt),
     }
 
-    logging.info(f"[PYTEST] Null FK counts: {summary}")
-    logging.info(f"[PYTEST] Null FK daily sample: {null_fk_daily_sample}")
-    logging.info(f"[PYTEST] Null FK snap  sample: {null_fk_snap_sample}")
-
-    return {
+    payload = {
         "has_issues": any(v > 0 for v in summary.values()),
         "counts": summary,
-        "samples": {
-            "null_fk_daily": null_fk_daily_sample,
-            "null_fk_snap": null_fk_snap_sample,
-        },
     }
+
+    logging.info("[PYTEST] Null FK counts: %s", json.dumps(payload, indent=2))
+    return payload
 
 
 def dq_branch_callable(ti, **_):
@@ -557,21 +558,25 @@ def dq_branch_callable(ti, **_):
 
     has_issues = bool(dq1.get("has_issues")) or bool(dq2.get("has_issues"))
 
-    logging.info("[BRANCH] dq1.has_issues=%s, dq2.has_issues=%s => has_issues=%s",
-                 dq1.get("has_issues"), dq2.get("has_issues"), has_issues)
-
+    logging.info("[BRANCH] dq1=%s dq2=%s => has_issues=%s", dq1, dq2, has_issues)
     return "dq_has_issues" if has_issues else "dq_clean"
 
 
 @task
-def log_branch_report():
+def log_after_backfill_report(ti=None):
     """
-    Just logs the XCom payloads again on the chosen branch.
+    Logs second-pass validation XCom after backfill.
     """
-    logging.info("[BRANCH] Follow-up branch task executed.")
+    dq1 = ti.xcom_pull(task_ids="pytest_orphans_and_dups_after_backfill") or {}
+    dq2 = ti.xcom_pull(task_ids="pytest_null_fks_after_backfill") or {}
+    logging.info("[AFTER_BACKFILL] pytest_orphans_and_dups_after_backfill=%s", json.dumps(dq1, indent=2))
+    logging.info("[AFTER_BACKFILL] pytest_null_fks_after_backfill=%s", json.dumps(dq2, indent=2))
     return "ok"
 
 
+# -----------------------------
+# DAG
+# -----------------------------
 default_args = {
     "owner": "team1",
     "depends_on_past": False,
@@ -582,11 +587,11 @@ default_args = {
 with DAG(
     dag_id=f"project1_stock_dimensional_etl_{GROUP_NUM}",
     default_args=default_args,
-    description="Snowflake->Snowflake dimensional model ETL (Team1)",
+    description="Snowflake->Snowflake dimensional model ETL (Team1) + SCD2 + 90d backfill + branching + recheck",
     start_date=datetime(2026, 2, 1),
     schedule_interval="@daily",
     catchup=False,
-    tags=["team1", "snowflake", "dimensional_model"],
+    tags=["team1", "snowflake", "dimensional_model", "scd2", "dq"],
 ) as dag:
 
     create_tables = SnowflakeOperator(
@@ -601,16 +606,16 @@ with DAG(
         sql=SQL_LOAD_DIM_DATE,
     )
 
-    upsert_dim_security = SnowflakeOperator(
-        task_id="upsert_dim_security",
+    scd2_dim_security = SnowflakeOperator(
+        task_id="scd2_dim_security",
         snowflake_conn_id=SNOWFLAKE_CONN_ID,
-        sql=SQL_MERGE_DIM_SECURITY,
+        sql=SQL_SCD2_DIM_SECURITY,
     )
 
-    merge_fact_stock_daily = SnowflakeOperator(
-        task_id="merge_fact_stock_daily",
+    merge_fact_stock_daily_90d = SnowflakeOperator(
+        task_id="merge_fact_stock_daily_90d",
         snowflake_conn_id=SNOWFLAKE_CONN_ID,
-        sql=SQL_MERGE_FACT_STOCK_DAILY,
+        sql=SQL_MERGE_FACT_STOCK_DAILY_90D,
     )
 
     merge_fact_security_snapshot = SnowflakeOperator(
@@ -619,33 +624,50 @@ with DAG(
         sql=SQL_MERGE_FACT_SECURITY_SNAPSHOT,
     )
 
-    # Keep SQL validate (may fail). If you want branching to always run, comment validate and connect to snapshot directly.
     validate = SnowflakeOperator(
         task_id="validate",
         snowflake_conn_id=SNOWFLAKE_CONN_ID,
         sql=SQL_VALIDATE,
     )
 
-    # Python tests (XCom outputs)
-    t_py_row_counts = pytest_row_counts()
+    # First-pass Python tests (XCom)
     t_py_orphans_dups = pytest_orphans_and_dups(sample_n=10)
-    t_py_null_fks = pytest_null_fks(sample_n=10)
+    t_py_null_fks = pytest_null_fks()
 
-    # Branching (reads XCom)
     dq_branch = BranchPythonOperator(
         task_id="dq_branch",
         python_callable=dq_branch_callable,
     )
+
     dq_has_issues = EmptyOperator(task_id="dq_has_issues")
     dq_clean = EmptyOperator(task_id="dq_clean")
 
-    # Optional follow-up logging tasks for each branch
-    followup_has_issues = log_branch_report.override(task_id="followup_has_issues")()
-    followup_clean = log_branch_report.override(task_id="followup_clean")()
+    # Backfill on issues
+    backfill_fact_stock_daily_90d = SnowflakeOperator(
+        task_id="backfill_fact_stock_daily_90d",
+        snowflake_conn_id=SNOWFLAKE_CONN_ID,
+        sql=SQL_BACKFILL_FACT_STOCK_DAILY_90D,
+    )
+
+    # Second-pass Python tests (after backfill) - must have unique task_ids
+    t_py_orphans_dups_after_backfill = pytest_orphans_and_dups.override(
+        task_id="pytest_orphans_and_dups_after_backfill"
+    )(sample_n=10)
+
+    t_py_null_fks_after_backfill = pytest_null_fks.override(
+        task_id="pytest_null_fks_after_backfill"
+    )()
+
+    followup_has_issues = log_after_backfill_report.override(task_id="followup_has_issues")()
+    followup_clean = EmptyOperator(task_id="followup_clean")
 
     # --- Dependencies ---
-    create_tables >> load_dim_date >> upsert_dim_security >> merge_fact_stock_daily >> merge_fact_security_snapshot >> validate
-    validate >> t_py_row_counts >> t_py_orphans_dups >> t_py_null_fks >> dq_branch
+    create_tables >> load_dim_date >> scd2_dim_security >> merge_fact_stock_daily_90d >> merge_fact_security_snapshot >> validate
 
-    dq_branch >> dq_has_issues >> followup_has_issues
+    validate >> t_py_orphans_dups >> t_py_null_fks >> dq_branch
+
     dq_branch >> dq_clean >> followup_clean
+
+    dq_branch >> dq_has_issues >> backfill_fact_stock_daily_90d \
+        >> t_py_orphans_dups_after_backfill >> t_py_null_fks_after_backfill \
+        >> followup_has_issues

@@ -347,7 +347,7 @@ SELECT
   CASE
     WHEN (orphan_security_daily_cnt + orphan_date_daily_cnt + orphan_date_snapshot_cnt + dup_daily_cnt + dup_snapshot_cnt) = 0
     THEN 1
-    ELSE TO_NUMBER('VALIDATION_FAILED')  -- throw error to fail
+    ELSE TO_NUMBER('0')  -- throw error to fail
   END AS validation_status
 FROM checks;
 

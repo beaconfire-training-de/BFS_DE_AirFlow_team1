@@ -1,321 +1,393 @@
+"""
+DAG: project1_stock_dimensional_etl_team1
 
-from __future__ import annotations
+Runs a single end-to-end ETL in Snowflake:
+1) Create/replace target tables (DIM_DATE_TEAM1, DIM_SECURITY_TEAM1, FACT_STOCK_DAILY_TEAM1, FACT_SECURITY_SNAPSHOT_TEAM1)
+2) Load DIM_DATE (calendar)
+3) Upsert DIM_SECURITY (SYMBOLS + COMPANY_PROFILE descriptive)
+4) Merge FACT_STOCK_DAILY (STOCK_HISTORY)
+5) Merge FACT_SECURITY_SNAPSHOT (COMPANY_PROFILE metrics snapshot as-of today)
+6) Validation queries (row counts, orphan checks, dup checks)
+
+Connection:
+SNOWFLAKE_CONN_ID = "jan_airflow_snowflake"
+"""
 
 from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
 
-from airflow.decorators import task
-from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
-import logging
 
 GROUP_NUM = "team1"
 SNOWFLAKE_CONN_ID = "jan_airflow_snowflake"
 
-default_args = {
-    "owner": GROUP_NUM,
-    "depends_on_past": False,
-    "retries": 0,
-    "retry_delay": timedelta(minutes=3),
-}
-
-
-
-
-with DAG(
-    dag_id=f"project1_stock_dimensional_etl_{GROUP_NUM}",
-    start_date=datetime(2024, 1, 1),
-    schedule_interval="@daily",   # daily trigger
-    catchup=False,
-    default_args=default_args,
-    tags=["project1", "snowflake", "stock", "team1",'etl','dwh'],
-) as dag:
-
-
-    load_fact = SnowflakeOperator(
-        task_id="load_fact",
-        snowflake_conn_id="jan_airflow_snowflake",
-        sql="""-- ============================================================
--- Stock Data Warehouse - Star Schema
--- Team 1 - Snowflake SQL DDL Scripts
--- Database: AIRFLOW0105
--- Schema: DEV
--- ============================================================
-
--- Set the context
+# -----------------------------
+# SQL: DDL
+# -----------------------------
+SQL_CREATE_TABLES = f"""
 USE DATABASE AIRFLOW0105;
 USE SCHEMA DEV;
 
--- ============================================================
--- 1. DIMENSION TABLE: dim_Date_1
--- Source: Generated date dimension (not from source tables)
--- ============================================================
-CREATE OR REPLACE TABLE AIRFLOW0105.DEV.dim_Date_1 (
-    date_key        INT             PRIMARY KEY,        -- Surrogate key (YYYYMMDD format)
-    full_date       DATE            NOT NULL,           -- Full date value
-    year            INT             NOT NULL,           -- Year (e.g., 2026)
-    quarter         INT             NOT NULL,           -- Quarter (1-4)
-    month           INT             NOT NULL,           -- Month (1-12)
-    month_name      VARCHAR(20)     NOT NULL,           -- Month name (e.g., 'January')
-    day_of_week     INT             NOT NULL,           -- Day of week (1=Sunday, 7=Saturday)
-    day_name        VARCHAR(20)     NOT NULL,           -- Day name (e.g., 'Monday')
-    is_weekend      BOOLEAN         NOT NULL,           -- TRUE if Saturday or Sunday
-    is_holiday      BOOLEAN         DEFAULT FALSE       -- TRUE if holiday (manually maintained)
+CREATE OR REPLACE TABLE DIM_DATE_{GROUP_NUM.upper()} (
+  DATE_KEY       NUMBER(8,0)   NOT NULL,   -- YYYYMMDD
+  FULL_DATE      DATE          NOT NULL,
+  YEAR           NUMBER(4,0)   NOT NULL,
+  QUARTER        NUMBER(1,0)   NOT NULL,
+  MONTH          NUMBER(2,0)   NOT NULL,
+  DAY            NUMBER(2,0)   NOT NULL,
+  WEEK_OF_YEAR   NUMBER(2,0)   NOT NULL,
+  DAY_OF_WEEK    NUMBER(1,0)   NOT NULL,   -- 1=Mon .. 7=Sun (ISO)
+  IS_WEEKEND     BOOLEAN       NOT NULL,
+  CONSTRAINT PK_DIM_DATE_{GROUP_NUM.upper()} PRIMARY KEY (DATE_KEY),
+  CONSTRAINT UQ_DIM_DATE_{GROUP_NUM.upper()}_FULL_DATE UNIQUE (FULL_DATE)
 );
 
-
--- ============================================================
--- 3. DIMENSION TABLE: dim_Company_1
--- Source: US_STOCK_DAILY.DCCM.COMPANY_PROFILE
--- ============================================================
-CREATE OR REPLACE TABLE AIRFLOW0105.DEV.dim_Company_1 (
-    company_key     INT             PRIMARY KEY AUTOINCREMENT,  -- Surrogate key
-    symbol          VARCHAR(20)     NOT NULL UNIQUE,            -- Stock symbol (business key)
-    company_name    VARCHAR(255),                               -- Company name
-    ceo             VARCHAR(255),                               -- CEO name
-    sector          VARCHAR(100),                               -- Sector (e.g., 'Technology')
-    industry        VARCHAR(255),                               -- Industry (e.g., 'Software')
-    exchange        VARCHAR(100),                               -- Exchange name
-    website         VARCHAR(500),                               -- Company website URL
-    beta            DECIMAL(10, 5),                             -- Beta coefficient
-    mktcap          BIGINT,                                     -- Market capitalization
-    description     TEXT                                        -- Company description
+CREATE OR REPLACE TABLE DIM_SECURITY_{GROUP_NUM.upper()} (
+  SECURITY_KEY       NUMBER(38,0) AUTOINCREMENT START 1 INCREMENT 1,
+  SYMBOL             VARCHAR(16)  NOT NULL,
+  SYMBOL_NAME        VARCHAR(256),
+  EXCHANGE           VARCHAR(64),
+  SOURCE_COMPANY_ID  NUMBER(38,0),
+  COMPANY_NAME       VARCHAR(512),
+  SECTOR             VARCHAR(64),
+  INDUSTRY           VARCHAR(64),
+  CEO                VARCHAR(64),
+  WEBSITE            VARCHAR(256),
+  DESCRIPTION        VARCHAR(4096),
+  CONSTRAINT PK_DIM_SECURITY_{GROUP_NUM.upper()} PRIMARY KEY (SECURITY_KEY),
+  CONSTRAINT UQ_DIM_SECURITY_{GROUP_NUM.upper()}_SYMBOL UNIQUE (SYMBOL)
 );
 
--- ============================================================
--- 4. FACT TABLE: fact_Stock_Daily_1
--- Source: US_STOCK_DAILY.DCCM.STOCK_HISTORY + calculated fields
--- ============================================================
-CREATE OR REPLACE TABLE AIRFLOW0105.DEV.fact_Stock_Daily_1 (
-    stock_daily_key INT             PRIMARY KEY AUTOINCREMENT,  -- Surrogate key
-    date_key        INT             NOT NULL,                   -- FK to dim_Date_1
-    company_key     INT,                                        -- FK to dim_Company_1 (nullable)
-    
-    -- Measures from source data
-    open_price      DECIMAL(18, 8),                             -- Opening price
-    high_price      DECIMAL(18, 8),                             -- Highest price
-    low_price       DECIMAL(18, 8),                             -- Lowest price
-    close_price     DECIMAL(18, 8),                             -- Closing price
-    adj_close       DECIMAL(18, 8),                             -- Adjusted closing price
-    volume          BIGINT,                                     -- Trading volume
-    volavg          DECIMAL(18, 8),                             -- Average volume
-    changes         DECIMAL(18, 8),                             -- Price changes
-    
-    -- Calculated fields
-    ma_7            DECIMAL(18, 8),                             -- 7-day moving average
-    ma_30           DECIMAL(18, 8),                             -- 30-day moving average
-    daily_return    DECIMAL(18, 8),                             -- Daily return rate
-    daily_change    DECIMAL(18, 8),                             -- Daily price change
-    
-    -- Foreign key constraints
-    CONSTRAINT fk_date FOREIGN KEY (date_key) REFERENCES  AIRFLOW0105.DEV.dim_Date_1(date_key),
-    CONSTRAINT fk_company FOREIGN KEY (company_key) REFERENCES  AIRFLOW0105.DEV.dim_Company_1(company_key)
+CREATE OR REPLACE TABLE FACT_STOCK_DAILY_{GROUP_NUM.upper()} (
+  SECURITY_KEY   NUMBER(38,0) NOT NULL,
+  DATE_KEY       NUMBER(8,0)  NOT NULL,
+  OPEN           NUMBER(18,8),
+  HIGH           NUMBER(18,8),
+  LOW            NUMBER(18,8),
+  CLOSE          NUMBER(18,8),
+  ADJCLOSE       NUMBER(18,8),
+  VOLUME         NUMBER(38,0),
+  LOAD_TS        TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+  CONSTRAINT FK_FSD_{GROUP_NUM.upper()}_SECURITY FOREIGN KEY (SECURITY_KEY)
+    REFERENCES DIM_SECURITY_{GROUP_NUM.upper()}(SECURITY_KEY),
+  CONSTRAINT FK_FSD_{GROUP_NUM.upper()}_DATE FOREIGN KEY (DATE_KEY)
+    REFERENCES DIM_DATE_{GROUP_NUM.upper()}(DATE_KEY),
+  CONSTRAINT UQ_FSD_{GROUP_NUM.upper()}_SECURITY_DATE UNIQUE (SECURITY_KEY, DATE_KEY)
 );
 
--- ============================================================
--- 5. POPULATE dim_Date_1 (Generate date dimension data)
--- Generate dates from 1990-01-01 to 2030-12-31
--- ============================================================
-INSERT INTO AIRFLOW0105.DEV.dim_Date_1 (date_key, full_date, year, quarter, month, month_name, day_of_week, day_name, is_weekend, is_holiday)
-SELECT
-    TO_NUMBER(TO_CHAR(date_value, 'YYYYMMDD')) AS date_key,
-    date_value AS full_date,
-    YEAR(date_value) AS year,
-    QUARTER(date_value) AS quarter,
-    MONTH(date_value) AS month,
-    MONTHNAME(date_value) AS month_name,
-    DAYOFWEEK(date_value) AS day_of_week,
-    DAYNAME(date_value) AS day_name,
-    CASE WHEN DAYOFWEEK(date_value) IN (0, 6) THEN TRUE ELSE FALSE END AS is_weekend,
-    FALSE AS is_holiday
-FROM (
-    SELECT DATEADD(DAY, SEQ4(), '1990-01-01'::DATE) AS date_value
-    FROM TABLE(GENERATOR(ROWCOUNT => 15000))  -- ~41 years of dates
-) dates
-WHERE date_value <= '2030-12-31';
+CREATE OR REPLACE TABLE FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()} (
+  SECURITY_KEY    NUMBER(38,0) NOT NULL,
+  ASOF_DATE_KEY   NUMBER(8,0)  NOT NULL,
+  PRICE           NUMBER(18,8),
+  BETA            NUMBER(18,8),
+  VOLAVG          NUMBER(38,0),
+  MKTCAP          NUMBER(38,0),
+  LASTDIV         NUMBER(18,8),
+  RANGE           VARCHAR(64),
+  CHANGES         NUMBER(18,8),
+  DCF             NUMBER(18,8),
+  DCFDIFF         NUMBER(18,8),
+  LOAD_TS         TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+  CONSTRAINT FK_FSS_{GROUP_NUM.upper()}_SECURITY FOREIGN KEY (SECURITY_KEY)
+    REFERENCES DIM_SECURITY_{GROUP_NUM.upper()}(SECURITY_KEY),
+  CONSTRAINT FK_FSS_{GROUP_NUM.upper()}_DATE FOREIGN KEY (ASOF_DATE_KEY)
+    REFERENCES DIM_DATE_{GROUP_NUM.upper()}(DATE_KEY),
+  CONSTRAINT UQ_FSS_{GROUP_NUM.upper()}_SECURITY_ASOF UNIQUE (SECURITY_KEY, ASOF_DATE_KEY)
+);
+"""
 
--- ============================================================
--- 7. POPULATE dim_Company_1 (Load from source)
--- ============================================================
-INSERT INTO AIRFLOW0105.DEV.dim_Company_1 (symbol, company_name, ceo, sector, industry, exchange, website, beta, mktcap, description)
-SELECT DISTINCT
-    u1.SYMBOL,
-    u1.NAME AS company_name, 
-    u2.CEO,
-    u2.SECTOR,
-    u2.INDUSTRY,
-    u1.EXCHANGE,       -- use Symbols‘ exchange （more complete）
-    u2.WEBSITE,
-    u2.BETA,
-    u2.MKTCAP,
-    u2.DESCRIPTION
-FROM US_STOCK_DAILY.DCCM.SYMBOLS u1
-LEFT JOIN US_STOCK_DAILY.DCCM.COMPANY_PROFILE u2
-    ON u1.SYMBOL = u2.SYMBOL;
+# -----------------------------
+# SQL: Loads / Merges
+# -----------------------------
+SQL_LOAD_DIM_DATE = f"""
+USE DATABASE AIRFLOW0105;
+USE SCHEMA DEV;
 
--- ============================================================
--- 8. POPULATE fact_Stock_Daily_1 (Initial Load)
--- Note: Calculated fields (ma_7, ma_30, daily_return, daily_change)
--- will be computed using window functions
--- ============================================================
-INSERT INTO AIRFLOW0105.DEV.fact_Stock_Daily_1 (
-    date_key, company_key,
-    open_price, high_price, low_price, close_price, adj_close, volume, volavg, changes,
-    ma_7, ma_30, daily_return, daily_change
-)
-WITH stock_with_calculations AS (
-    SELECT
-        sh.SYMBOL,
-        sh.DATE,
-        sh.OPEN,
-        sh.HIGH,
-        sh.LOW,
-        sh.CLOSE,
-        sh.ADJCLOSE,
-        sh.VOLUME,
-        cp.VOLAVG,
-        cp.CHANGES,
-        -- 7-day moving average
-        AVG(sh.CLOSE) OVER (
-            PARTITION BY sh.SYMBOL 
-            ORDER BY sh.DATE 
-            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
-        ) AS ma_7,
-        -- 30-day moving average
-        AVG(sh.CLOSE) OVER (
-            PARTITION BY sh.SYMBOL 
-            ORDER BY sh.DATE 
-            ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
-        ) AS ma_30,
-        -- Daily return: (close - previous_close) / previous_close
-        (sh.CLOSE - LAG(sh.CLOSE) OVER (PARTITION BY sh.SYMBOL ORDER BY sh.DATE)) 
-            / NULLIF(LAG(sh.CLOSE) OVER (PARTITION BY sh.SYMBOL ORDER BY sh.DATE), 0) AS daily_return,
-        -- Daily change: close - previous_close
-        sh.CLOSE - LAG(sh.CLOSE) OVER (PARTITION BY sh.SYMBOL ORDER BY sh.DATE) AS daily_change
-    FROM US_STOCK_DAILY.DCCM.STOCK_HISTORY sh
-    LEFT JOIN US_STOCK_DAILY.DCCM.COMPANY_PROFILE cp ON sh.SYMBOL = cp.SYMBOL
+INSERT OVERWRITE INTO DIM_DATE_{GROUP_NUM.upper()}
+WITH dates AS (
+  SELECT DATEADD(DAY, SEQ4(), '1990-01-01'::DATE) AS d
+  FROM TABLE(GENERATOR(ROWCOUNT => DATEDIFF(DAY, '1990-01-01'::DATE, '2035-12-31'::DATE) + 1))
 )
 SELECT
-    d.date_key,
-    
-    c.company_key,          -- Can be NULL if no company profile exists
-    swc.OPEN,
-    swc.HIGH,
-    swc.LOW,
-    swc.CLOSE,
-    swc.ADJCLOSE,
-    swc.VOLUME,
-    swc.VOLAVG,
-    swc.CHANGES,
-    swc.ma_7,
-    swc.ma_30,
-    swc.daily_return,
-    swc.daily_change
-FROM stock_with_calculations swc
-INNER JOIN AIRFLOW0105.DEV.dim_Date_1 d ON TO_NUMBER(TO_CHAR(swc.DATE, 'YYYYMMDD')) = d.date_key
-LEFT JOIN AIRFLOW0105.DEV.dim_Company_1 c ON swc.SYMBOL = c.symbol;
+  TO_NUMBER(TO_CHAR(d, 'YYYYMMDD'))                     AS DATE_KEY,
+  d                                                     AS FULL_DATE,
+  YEAR(d)                                               AS YEAR,
+  QUARTER(d)                                            AS QUARTER,
+  MONTH(d)                                              AS MONTH,
+  DAY(d)                                                AS DAY,
+  WEEKOFYEAR(d)                                         AS WEEK_OF_YEAR,
+  DAYOFWEEKISO(d)                                       AS DAY_OF_WEEK,
+  IFF(DAYOFWEEKISO(d) IN (6,7), TRUE, FALSE)            AS IS_WEEKEND
+FROM dates;
+"""
 
--- Incremental data for  dim_Company_1
-MERGE INTO AIRFLOW0105.DEV.dim_Company_1 AS target
+SQL_MERGE_DIM_SECURITY = f"""
+USE DATABASE AIRFLOW0105;
+USE SCHEMA DEV;
+
+MERGE INTO DIM_SECURITY_{GROUP_NUM.upper()} tgt
 USING (
-    SELECT DISTINCT
-        u1.SYMBOL,
-        u1.NAME AS company_name,
-        u2.CEO,
-        u2.SECTOR,
-        u2.INDUSTRY,
-        u1.EXCHANGE,
-        u2.WEBSITE,
-        u2.BETA,
-        u2.MKTCAP,
-        u2.DESCRIPTION
-    FROM US_STOCK_DAILY.DCCM.SYMBOLS u1
-    LEFT JOIN US_STOCK_DAILY.DCCM.COMPANY_PROFILE u2
-        ON u1.SYMBOL = u2.SYMBOL
-) AS source
-ON target.symbol = source.SYMBOL
--- if mached then update
-WHEN MATCHED THEN UPDATE SET
-    target.company_name = source.company_name,
-    target.ceo = source.CEO,
-    target.sector = source.SECTOR,
-    target.industry = source.INDUSTRY,
-    target.exchange = source.EXCHANGE,
-    target.website = source.WEBSITE,
-    target.beta = source.BETA,
-    target.mktcap = source.MKTCAP,
-    target.description = source.DESCRIPTION
--- if not，insert new
-WHEN NOT MATCHED THEN INSERT (symbol, company_name, ceo, sector, industry, exchange, website, beta, mktcap, description)
-VALUES (source.SYMBOL, source.company_name, source.CEO, source.SECTOR, source.INDUSTRY, source.EXCHANGE, source.WEBSITE, source.BETA, source.MKTCAP, source.DESCRIPTION);
-
--- 增量加载 fact_Stock_Daily_1
--- 方法：只加载比目标表中最新日期更新的数据
-
-MERGE INTO AIRFLOW0105.DEV.fact_Stock_Daily_1 AS target
-USING (
-    WITH stock_with_calculations AS (
-        SELECT
-            sh.SYMBOL,
-            sh.DATE,
-            sh.OPEN,
-            sh.HIGH,
-            sh.LOW,
-            sh.CLOSE,
-            sh.ADJCLOSE,
-            sh.VOLUME,
-            cp.VOLAVG,
-            cp.CHANGES,
-            AVG(sh.CLOSE) OVER (
-                PARTITION BY sh.SYMBOL 
-                ORDER BY sh.DATE 
-                ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
-            ) AS ma_7,
-            AVG(sh.CLOSE) OVER (
-                PARTITION BY sh.SYMBOL 
-                ORDER BY sh.DATE 
-                ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
-            ) AS ma_30,
-            (sh.CLOSE - LAG(sh.CLOSE) OVER (PARTITION BY sh.SYMBOL ORDER BY sh.DATE)) 
-                / NULLIF(LAG(sh.CLOSE) OVER (PARTITION BY sh.SYMBOL ORDER BY sh.DATE), 0) AS daily_return,
-            sh.CLOSE - LAG(sh.CLOSE) OVER (PARTITION BY sh.SYMBOL ORDER BY sh.DATE) AS daily_change
-        FROM US_STOCK_DAILY.DCCM.STOCK_HISTORY sh
-        LEFT JOIN US_STOCK_DAILY.DCCM.COMPANY_PROFILE cp ON sh.SYMBOL = cp.SYMBOL
-        -- 只选择新数据（比目标表最新日期更新的）
-        WHERE sh.DATE > (SELECT COALESCE(MAX(d.full_date), '1900-01-01') 
-                         FROM AIRFLOW0105.DEV.fact_Stock_Daily_1 f
-                         JOIN AIRFLOW0105.DEV.dim_Date_1 d ON f.date_key = d.date_key)
-    )
+  WITH cp AS (
     SELECT
-        d.date_key,
-        c.company_key,
-        swc.*
-    FROM stock_with_calculations swc
-    INNER JOIN AIRFLOW0105.DEV.dim_Date_1 d ON TO_NUMBER(TO_CHAR(swc.DATE, 'YYYYMMDD')) = d.date_key
-    LEFT JOIN AIRFLOW0105.DEV.dim_Company_1 c ON swc.SYMBOL = c.symbol
-) AS source
-ON target.date_key = source.date_key AND target.company_key = source.company_key
--- 如果匹配到（同一天同一股票），更新数据
+      ID,
+      SYMBOL,
+      COMPANYNAME,
+      EXCHANGE,
+      INDUSTRY,
+      WEBSITE,
+      DESCRIPTION,
+      CEO,
+      SECTOR
+    FROM US_STOCK_DAILY.DCCM.COMPANY_PROFILE
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY SYMBOL ORDER BY ID DESC) = 1
+  )
+  SELECT
+    s.SYMBOL                                  AS SYMBOL,
+    s.NAME                                    AS SYMBOL_NAME,
+    COALESCE(cp.EXCHANGE, s.EXCHANGE)         AS EXCHANGE,
+    cp.ID                                     AS SOURCE_COMPANY_ID,
+    cp.COMPANYNAME                            AS COMPANY_NAME,
+    cp.SECTOR                                 AS SECTOR,
+    cp.INDUSTRY                               AS INDUSTRY,
+    cp.CEO                                    AS CEO,
+    cp.WEBSITE                                AS WEBSITE,
+    cp.DESCRIPTION                            AS DESCRIPTION
+  FROM US_STOCK_DAILY.DCCM.SYMBOLS s
+  LEFT JOIN cp
+    ON cp.SYMBOL = s.SYMBOL
+) src
+ON tgt.SYMBOL = src.SYMBOL
 WHEN MATCHED THEN UPDATE SET
-    target.open_price = source.OPEN,
-    target.high_price = source.HIGH,
-    target.low_price = source.LOW,
-    target.close_price = source.CLOSE,
-    target.adj_close = source.ADJCLOSE,
-    target.volume = source.VOLUME,
-    target.volavg = source.VOLAVG,
-    target.changes = source.CHANGES,
-    target.ma_7 = source.ma_7,
-    target.ma_30 = source.ma_30,
-    target.daily_return = source.daily_return,
-    target.daily_change = source.daily_change
--- 如果没匹配到，插入新数据
-WHEN NOT MATCHED THEN INSERT (date_key, company_key, open_price, high_price, low_price, close_price, adj_close, volume, volavg, changes, ma_7, ma_30, daily_return, daily_change)
-VALUES (source.date_key, source.company_key, source.OPEN, source.HIGH, source.LOW, source.CLOSE, source.ADJCLOSE, source.VOLUME, source.VOLAVG, source.CHANGES, source.ma_7, source.ma_30, source.daily_return, source.daily_change);"""
+  tgt.SYMBOL_NAME       = src.SYMBOL_NAME,
+  tgt.EXCHANGE          = src.EXCHANGE,
+  tgt.SOURCE_COMPANY_ID = src.SOURCE_COMPANY_ID,
+  tgt.COMPANY_NAME      = src.COMPANY_NAME,
+  tgt.SECTOR            = src.SECTOR,
+  tgt.INDUSTRY          = src.INDUSTRY,
+  tgt.CEO               = src.CEO,
+  tgt.WEBSITE           = src.WEBSITE,
+  tgt.DESCRIPTION       = src.DESCRIPTION
+WHEN NOT MATCHED THEN INSERT (
+  SYMBOL, SYMBOL_NAME, EXCHANGE, SOURCE_COMPANY_ID, COMPANY_NAME, SECTOR, INDUSTRY, CEO, WEBSITE, DESCRIPTION
+) VALUES (
+  src.SYMBOL, src.SYMBOL_NAME, src.EXCHANGE, src.SOURCE_COMPANY_ID, src.COMPANY_NAME, src.SECTOR, src.INDUSTRY, src.CEO, src.WEBSITE, src.DESCRIPTION
+);
+"""
+
+SQL_MERGE_FACT_STOCK_DAILY = f"""
+USE DATABASE AIRFLOW0105;
+USE SCHEMA DEV;
+
+MERGE INTO FACT_STOCK_DAILY_{GROUP_NUM.upper()} tgt
+USING (
+  SELECT
+    ds.SECURITY_KEY                                           AS SECURITY_KEY,
+    dd.DATE_KEY                                               AS DATE_KEY,
+    sh.OPEN                                                   AS OPEN,
+    sh.HIGH                                                   AS HIGH,
+    sh.LOW                                                    AS LOW,
+    sh.CLOSE                                                  AS CLOSE,
+    sh.ADJCLOSE                                               AS ADJCLOSE,
+    sh.VOLUME                                                 AS VOLUME
+  FROM US_STOCK_DAILY.DCCM.STOCK_HISTORY sh
+  JOIN DIM_SECURITY_{GROUP_NUM.upper()} ds
+    ON ds.SYMBOL = sh.SYMBOL
+  JOIN DIM_DATE_{GROUP_NUM.upper()} dd
+    ON dd.FULL_DATE = sh.DATE
+) src
+ON tgt.SECURITY_KEY = src.SECURITY_KEY
+AND tgt.DATE_KEY     = src.DATE_KEY
+WHEN MATCHED THEN UPDATE SET
+  tgt.OPEN     = src.OPEN,
+  tgt.HIGH     = src.HIGH,
+  tgt.LOW      = src.LOW,
+  tgt.CLOSE    = src.CLOSE,
+  tgt.ADJCLOSE = src.ADJCLOSE,
+  tgt.VOLUME   = src.VOLUME,
+  tgt.LOAD_TS  = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (
+  SECURITY_KEY, DATE_KEY, OPEN, HIGH, LOW, CLOSE, ADJCLOSE, VOLUME
+) VALUES (
+  src.SECURITY_KEY, src.DATE_KEY, src.OPEN, src.HIGH, src.LOW, src.CLOSE, src.ADJCLOSE, src.VOLUME
+);
+"""
+
+SQL_MERGE_FACT_SECURITY_SNAPSHOT = f"""
+USE DATABASE AIRFLOW0105;
+USE SCHEMA DEV;
+
+MERGE INTO FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()} tgt
+USING (
+  WITH cp AS (
+    SELECT
+      ID,
+      SYMBOL,
+      PRICE,
+      BETA,
+      VOLAVG,
+      MKTCAP,
+      LASTDIV,
+      RANGE,
+      CHANGES,
+      DCF,
+      DCFDIFF
+    FROM US_STOCK_DAILY.DCCM.COMPANY_PROFILE
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY SYMBOL ORDER BY ID DESC) = 1
+  )
+  SELECT
+    ds.SECURITY_KEY                                  AS SECURITY_KEY,
+    TO_NUMBER(TO_CHAR(CURRENT_DATE(), 'YYYYMMDD'))   AS ASOF_DATE_KEY,
+    cp.PRICE                                         AS PRICE,
+    cp.BETA                                          AS BETA,
+    cp.VOLAVG                                        AS VOLAVG,
+    cp.MKTCAP                                        AS MKTCAP,
+    cp.LASTDIV                                       AS LASTDIV,
+    cp.RANGE                                         AS RANGE,
+    cp.CHANGES                                       AS CHANGES,
+    cp.DCF                                           AS DCF,
+    cp.DCFDIFF                                       AS DCFDIFF
+  FROM cp
+  JOIN DIM_SECURITY_{GROUP_NUM.upper()} ds
+    ON ds.SYMBOL = cp.SYMBOL
+) src
+ON tgt.SECURITY_KEY   = src.SECURITY_KEY
+AND tgt.ASOF_DATE_KEY = src.ASOF_DATE_KEY
+WHEN MATCHED THEN UPDATE SET
+  tgt.PRICE    = src.PRICE,
+  tgt.BETA     = src.BETA,
+  tgt.VOLAVG   = src.VOLAVG,
+  tgt.MKTCAP   = src.MKTCAP,
+  tgt.LASTDIV  = src.LASTDIV,
+  tgt.RANGE    = src.RANGE,
+  tgt.CHANGES  = src.CHANGES,
+  tgt.DCF      = src.DCF,
+  tgt.DCFDIFF  = src.DCFDIFF,
+  tgt.LOAD_TS  = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (
+  SECURITY_KEY, ASOF_DATE_KEY, PRICE, BETA, VOLAVG, MKTCAP, LASTDIV, RANGE, CHANGES, DCF, DCFDIFF
+) VALUES (
+  src.SECURITY_KEY, src.ASOF_DATE_KEY, src.PRICE, src.BETA, src.VOLAVG, src.MKTCAP, src.LASTDIV, src.RANGE, src.CHANGES, src.DCF, src.DCFDIFF
+);
+"""
+
+# -----------------------------
+# SQL: Validations (fail DAG if bad)
+# SnowflakeOperator will fail if any statement errors; to "fail on bad data",
+# we turn bad conditions into errors using division by zero / assert-like patterns.
+# -----------------------------
+SQL_VALIDATE = f"""
+USE DATABASE AIRFLOW0105;
+USE SCHEMA DEV;
+
+-- 1) Orphan checks: force error if count > 0
+WITH orphan_security_daily AS (
+  SELECT COUNT(*) AS c
+  FROM FACT_STOCK_DAILY_{GROUP_NUM.upper()} f
+  LEFT JOIN DIM_SECURITY_{GROUP_NUM.upper()} d
+    ON f.SECURITY_KEY = d.SECURITY_KEY
+  WHERE d.SECURITY_KEY IS NULL
+),
+orphan_date_daily AS (
+  SELECT COUNT(*) AS c
+  FROM FACT_STOCK_DAILY_{GROUP_NUM.upper()} f
+  LEFT JOIN DIM_DATE_{GROUP_NUM.upper()} d
+    ON f.DATE_KEY = d.DATE_KEY
+  WHERE d.DATE_KEY IS NULL
+),
+orphan_date_snapshot AS (
+  SELECT COUNT(*) AS c
+  FROM FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()} s
+  LEFT JOIN DIM_DATE_{GROUP_NUM.upper()} d
+    ON s.ASOF_DATE_KEY = d.DATE_KEY
+  WHERE d.DATE_KEY IS NULL
+),
+dup_daily AS (
+  SELECT COUNT(*) AS c
+  FROM (
+    SELECT SECURITY_KEY, DATE_KEY
+    FROM FACT_STOCK_DAILY_{GROUP_NUM.upper()}
+    GROUP BY 1,2
+    HAVING COUNT(*) > 1
+  )
+),
+dup_snapshot AS (
+  SELECT COUNT(*) AS c
+  FROM (
+    SELECT SECURITY_KEY, ASOF_DATE_KEY
+    FROM FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()}
+    GROUP BY 1,2
+    HAVING COUNT(*) > 1
+  )
+)
+SELECT
+  IFF((SELECT c FROM orphan_security_daily)=0, 1, 1/0) AS assert_orphan_security_daily,
+  IFF((SELECT c FROM orphan_date_daily)=0, 1, 1/0)     AS assert_orphan_date_daily,
+  IFF((SELECT c FROM orphan_date_snapshot)=0, 1, 1/0)  AS assert_orphan_date_snapshot,
+  IFF((SELECT c FROM dup_daily)=0, 1, 1/0)             AS assert_dup_daily,
+  IFF((SELECT c FROM dup_snapshot)=0, 1, 1/0)          AS assert_dup_snapshot
+;
+
+-- 2) Row counts (informational)
+SELECT
+  (SELECT COUNT(*) FROM DIM_DATE_{GROUP_NUM.upper()})               AS dim_date_cnt,
+  (SELECT COUNT(*) FROM DIM_SECURITY_{GROUP_NUM.upper()})           AS dim_security_cnt,
+  (SELECT COUNT(*) FROM FACT_STOCK_DAILY_{GROUP_NUM.upper()})       AS fact_stock_daily_cnt,
+  (SELECT COUNT(*) FROM FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()}) AS fact_security_snapshot_cnt
+;
+"""
+
+default_args = {
+    "owner": "team1",
+    "depends_on_past": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+with DAG(
+    dag_id=f"project1_stock_dimensional_etl_{GROUP_NUM}",
+    default_args=default_args,
+    description="Snowflake->Snowflake dimensional model ETL (Team1)",
+    start_date=datetime(2026, 2, 1),
+    schedule_interval="@daily",
+    catchup=False,
+    tags=["team1", "snowflake", "dimensional_model"],
+) as dag:
+
+    create_tables = SnowflakeOperator(
+        task_id="create_tables",
+        snowflake_conn_id=SNOWFLAKE_CONN_ID,
+        sql=SQL_CREATE_TABLES,
     )
 
+    load_dim_date = SnowflakeOperator(
+        task_id="load_dim_date",
+        snowflake_conn_id=SNOWFLAKE_CONN_ID,
+        sql=SQL_LOAD_DIM_DATE,
+    )
 
-    
+    upsert_dim_security = SnowflakeOperator(
+        task_id="upsert_dim_security",
+        snowflake_conn_id=SNOWFLAKE_CONN_ID,
+        sql=SQL_MERGE_DIM_SECURITY,
+    )
 
-    load_fact
+    merge_fact_stock_daily = SnowflakeOperator(
+        task_id="merge_fact_stock_daily",
+        snowflake_conn_id=SNOWFLAKE_CONN_ID,
+        sql=SQL_MERGE_FACT_STOCK_DAILY,
+    )
+
+    merge_fact_security_snapshot = SnowflakeOperator(
+        task_id="merge_fact_security_snapshot",
+        snowflake_conn_id=SNOWFLAKE_CONN_ID,
+        sql=SQL_MERGE_FACT_SECURITY_SNAPSHOT,
+    )
+
+    validate = SnowflakeOperator(
+        task_id="validate",
+        snowflake_conn_id=SNOWFLAKE_CONN_ID,
+        sql=SQL_VALIDATE,
+    )
+
+    create_tables >> load_dim_date >> upsert_dim_security >> merge_fact_stock_daily >> merge_fact_security_snapshot >> validate

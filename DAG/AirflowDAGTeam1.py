@@ -608,7 +608,7 @@ with DAG(
     scd2_dim_security = SnowflakeOperator(
     task_id="scd2_dim_security",
     snowflake_conn_id=SNOWFLAKE_CONN_ID,
-    sql=[SQL_SCD2_EXPIRE, SQL_SCD2_INSERT],
+    sql=SQL_SCD2_DIM_SECURITY,
     )
 
 

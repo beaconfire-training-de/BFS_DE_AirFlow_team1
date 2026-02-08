@@ -280,25 +280,26 @@ SQL_VALIDATE = f"""
 USE DATABASE AIRFLOW0105;
 USE SCHEMA DEV;
 
--- 1) Orphan checks: force error if count > 0
-WITH orphan_security_daily AS (
+-- Compute all validation counts in one row
+WITH
+orphan_security_daily AS (
   SELECT COUNT(*) AS c
-  FROM FACT_STOCK_DAILY_{GROUP_NUM.upper()} f
-  LEFT JOIN DIM_SECURITY_{GROUP_NUM.upper()} d
+  FROM FACT_STOCK_DAILY_TEAM1 f
+  LEFT JOIN DIM_SECURITY_TEAM1 d
     ON f.SECURITY_KEY = d.SECURITY_KEY
   WHERE d.SECURITY_KEY IS NULL
 ),
 orphan_date_daily AS (
   SELECT COUNT(*) AS c
-  FROM FACT_STOCK_DAILY_{GROUP_NUM.upper()} f
-  LEFT JOIN DIM_DATE_{GROUP_NUM.upper()} d
+  FROM FACT_STOCK_DAILY_TEAM1 f
+  LEFT JOIN DIM_DATE_TEAM1 d
     ON f.DATE_KEY = d.DATE_KEY
   WHERE d.DATE_KEY IS NULL
 ),
 orphan_date_snapshot AS (
   SELECT COUNT(*) AS c
-  FROM FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()} s
-  LEFT JOIN DIM_DATE_{GROUP_NUM.upper()} d
+  FROM FACT_SECURITY_SNAPSHOT_TEAM1 s
+  LEFT JOIN DIM_DATE_TEAM1 d
     ON s.ASOF_DATE_KEY = d.DATE_KEY
   WHERE d.DATE_KEY IS NULL
 ),
@@ -306,7 +307,7 @@ dup_daily AS (
   SELECT COUNT(*) AS c
   FROM (
     SELECT SECURITY_KEY, DATE_KEY
-    FROM FACT_STOCK_DAILY_{GROUP_NUM.upper()}
+    FROM FACT_STOCK_DAILY_TEAM1
     GROUP BY 1,2
     HAVING COUNT(*) > 1
   )
@@ -315,26 +316,66 @@ dup_snapshot AS (
   SELECT COUNT(*) AS c
   FROM (
     SELECT SECURITY_KEY, ASOF_DATE_KEY
-    FROM FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()}
+    FROM FACT_SECURITY_SNAPSHOT_TEAM1
     GROUP BY 1,2
     HAVING COUNT(*) > 1
   )
+),
+checks AS (
+  SELECT
+    (SELECT c FROM orphan_security_daily) AS orphan_security_daily_cnt,
+    (SELECT c FROM orphan_date_daily)     AS orphan_date_daily_cnt,
+    (SELECT c FROM orphan_date_snapshot)  AS orphan_date_snapshot_cnt,
+    (SELECT c FROM dup_daily)             AS dup_daily_cnt,
+    (SELECT c FROM dup_snapshot)          AS dup_snapshot_cnt
+)
+-- 1) Always print the counts (debug-friendly)
+SELECT * FROM checks;
+
+-- 2) Fail if any count > 0 (but message will be in logs from above)
+WITH checks AS (
+  SELECT
+    (SELECT COUNT(*) FROM FACT_STOCK_DAILY_TEAM1 f
+      LEFT JOIN DIM_SECURITY_TEAM1 d ON f.SECURITY_KEY=d.SECURITY_KEY
+      WHERE d.SECURITY_KEY IS NULL) AS orphan_security_daily_cnt,
+
+    (SELECT COUNT(*) FROM FACT_STOCK_DAILY_TEAM1 f
+      LEFT JOIN DIM_DATE_TEAM1 d ON f.DATE_KEY=d.DATE_KEY
+      WHERE d.DATE_KEY IS NULL) AS orphan_date_daily_cnt,
+
+    (SELECT COUNT(*) FROM FACT_SECURITY_SNAPSHOT_TEAM1 s
+      LEFT JOIN DIM_DATE_TEAM1 d ON s.ASOF_DATE_KEY=d.DATE_KEY
+      WHERE d.DATE_KEY IS NULL) AS orphan_date_snapshot_cnt,
+
+    (SELECT COUNT(*) FROM (
+      SELECT SECURITY_KEY, DATE_KEY
+      FROM FACT_STOCK_DAILY_TEAM1
+      GROUP BY 1,2
+      HAVING COUNT(*) > 1
+    )) AS dup_daily_cnt,
+
+    (SELECT COUNT(*) FROM (
+      SELECT SECURITY_KEY, ASOF_DATE_KEY
+      FROM FACT_SECURITY_SNAPSHOT_TEAM1
+      GROUP BY 1,2
+      HAVING COUNT(*) > 1
+    )) AS dup_snapshot_cnt
 )
 SELECT
-  IFF((SELECT c FROM orphan_security_daily)=0, 1, 1/0) AS assert_orphan_security_daily,
-  IFF((SELECT c FROM orphan_date_daily)=0, 1, 1/0)     AS assert_orphan_date_daily,
-  IFF((SELECT c FROM orphan_date_snapshot)=0, 1, 1/0)  AS assert_orphan_date_snapshot,
-  IFF((SELECT c FROM dup_daily)=0, 1, 1/0)             AS assert_dup_daily,
-  IFF((SELECT c FROM dup_snapshot)=0, 1, 1/0)          AS assert_dup_snapshot
-;
+  CASE
+    WHEN (orphan_security_daily_cnt + orphan_date_daily_cnt + orphan_date_snapshot_cnt + dup_daily_cnt + dup_snapshot_cnt) = 0
+    THEN 1
+    ELSE TO_NUMBER('VALIDATION_FAILED')  -- will throw a conversion error
+  END AS validation_status
+FROM checks;
 
--- 2) Row counts (informational)
+-- 3) Row counts (optional info)
 SELECT
-  (SELECT COUNT(*) FROM DIM_DATE_{GROUP_NUM.upper()})               AS dim_date_cnt,
-  (SELECT COUNT(*) FROM DIM_SECURITY_{GROUP_NUM.upper()})           AS dim_security_cnt,
-  (SELECT COUNT(*) FROM FACT_STOCK_DAILY_{GROUP_NUM.upper()})       AS fact_stock_daily_cnt,
-  (SELECT COUNT(*) FROM FACT_SECURITY_SNAPSHOT_{GROUP_NUM.upper()}) AS fact_security_snapshot_cnt
-;
+  (SELECT COUNT(*) FROM DIM_DATE_TEAM1)               AS dim_date_cnt,
+  (SELECT COUNT(*) FROM DIM_SECURITY_TEAM1)           AS dim_security_cnt,
+  (SELECT COUNT(*) FROM FACT_STOCK_DAILY_TEAM1)       AS fact_stock_daily_cnt,
+  (SELECT COUNT(*) FROM FACT_SECURITY_SNAPSHOT_TEAM1) AS fact_security_snapshot_cnt;
+
 """
 
 default_args = {

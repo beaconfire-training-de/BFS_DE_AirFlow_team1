@@ -1,0 +1,8 @@
+SELECT
+  COUNT(*) AS bad_cnt
+FROM (
+  SELECT symbol
+  FROM AIRFLOW0105.DEV.STG_SYMBOLS_4
+  GROUP BY symbol
+  HAVING symbol IS NULL OR COUNT(*) > 1
+);
